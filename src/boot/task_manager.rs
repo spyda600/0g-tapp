@@ -15,7 +15,7 @@ pub enum TaskStatus {
 #[derive(Debug, Clone)]
 pub struct TaskSuccessResult {
     pub app_id: String,
-    pub deployer: Vec<u8>,
+    pub deployer: String, // EVM address from signature authentication
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ impl Task {
             }),
             TaskStatus::Failed(error) => Some(TaskResult {
                 app_id: String::new(),
-                deployer: vec![],
+                deployer: String::new(),
                 error: error.clone(),
             }),
             _ => None,

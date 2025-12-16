@@ -181,7 +181,6 @@ async fn start_app(
         compose_content,
         app_id: app_id.clone(),
         mount_files,
-        deployer: vec![0; 32],
     });
 
     let response = client.start_app(request).await?;

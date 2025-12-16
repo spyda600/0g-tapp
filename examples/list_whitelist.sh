@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# Get service logs from TAPP service with Ethereum signature authentication
+# List whitelisted addresses from TAPP service with Ethereum signature authentication
 # Usage:
-#   ./get_service_logs.sh [OPTIONS]
+#   ./list_whitelist.sh [OPTIONS]
 #
 # Examples:
-#   ./get_service_logs.sh --host 39.97.63.199 --use-owner                    # List all log files
-#   ./get_service_logs.sh --host 39.97.63.199 --file app.log --use-owner     # Get last 100 lines
-#   ./get_service_logs.sh --host 39.97.63.199 --file app.log --lines 200 --use-whitelist
+#   ./list_whitelist.sh --host 39.97.63.199 --use-owner
+#   ./list_whitelist.sh --host 39.97.63.199 --use-whitelist
 
 set -e
 
@@ -17,8 +16,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Default configuration
 DEFAULT_HOST="localhost"
 DEFAULT_PORT="50051"
-DEFAULT_LINES="100"
-DEFAULT_FILE_NAME=""
 
 # Pre-configured addresses (for reference only)
 OWNER_ADDRESS="0xea695C312CE119dE347425B29AFf85371c9d1837"
@@ -34,8 +31,6 @@ WHITELIST_PRIVATE_KEY="${TAPP_WHITELIST_PRIVATE_KEY:-}"
 # Parse command line arguments
 TARGET_HOST="$DEFAULT_HOST"
 TARGET_PORT="$DEFAULT_PORT"
-FILE_NAME=""
-LINES=""
 PRIVATE_KEY=""
 USE_OWNER=false
 USE_WHITELIST=false
@@ -48,14 +43,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --port)
             TARGET_PORT="$2"
-            shift 2
-            ;;
-        --file)
-            FILE_NAME="$2"
-            shift 2
-            ;;
-        --lines)
-            LINES="$2"
             shift 2
             ;;
         --private-key)
@@ -76,8 +63,6 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --host HOST             gRPC server host (default: $DEFAULT_HOST)"
             echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
-            echo "  --file FILE_NAME        Log file name (empty = list all files)"
-            echo "  --lines LINES           Number of log lines to retrieve (default: $DEFAULT_LINES)"
             echo "  --private-key KEY       Private key for signing (required unless using presets)"
             echo "  --use-owner             Use pre-configured owner credentials (requires TAPP_OWNER_PRIVATE_KEY env var)"
             echo "  --use-whitelist         Use pre-configured whitelist user credentials (requires TAPP_WHITELIST_PRIVATE_KEY env var)"
@@ -89,8 +74,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Examples:"
             echo "  $0 --host 39.97.63.199 --use-owner"
-            echo "  $0 --host 39.97.63.199 --file app.log --use-owner"
-            echo "  $0 --host 39.97.63.199 --file app.log --lines 200 --use-whitelist"
+            echo "  $0 --host 39.97.63.199 --use-whitelist"
+            echo "  $0 --host 39.97.63.199 --private-key 0x..."
             echo ""
             echo "Pre-configured users:"
             echo "  Owner: $OWNER_ADDRESS"
@@ -99,15 +84,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             # Support legacy positional arguments for backward compatibility
-            # Original order: HOST PORT FILE_NAME LINES
+            # Original order: HOST PORT
             if [ "$TARGET_HOST" = "$DEFAULT_HOST" ]; then
                 TARGET_HOST="$1"
             elif [ "$TARGET_PORT" = "$DEFAULT_PORT" ]; then
                 TARGET_PORT="$1"
-            elif [ -z "$FILE_NAME" ]; then
-                FILE_NAME="$1"
-            elif [ -z "$LINES" ]; then
-                LINES="$1"
             else
                 echo "Unknown option: $1"
                 echo "Use --help for usage information"
@@ -148,18 +129,6 @@ elif [ -z "$PRIVATE_KEY" ]; then
 fi
 
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
-
-# Apply defaults
-if [ -z "$LINES" ]; then
-    LINES="$DEFAULT_LINES"
-fi
-
-# Validate lines (must be a positive integer)
-if ! [[ "$LINES" =~ ^[0-9]+$ ]] || [ "$LINES" -le 0 ]; then
-    echo "Error: Lines must be a positive integer"
-    echo "Got: $LINES"
-    exit 1
-fi
 
 echo "Checking dependencies..."
 # Check if sign_message.py exists
@@ -284,22 +253,54 @@ fi
 echo "✅ All dependencies satisfied"
 echo ""
 
+# Create Python script for signature generation
+cat > /tmp/sign_message.py << 'PYTHON_SCRIPT'
+#!/usr/bin/env python3
+import sys
+import time
+from eth_account import Account
+from eth_account.messages import encode_defunct
+
+if len(sys.argv) != 3:
+    print("Usage: sign_message.py <method_name> <private_key>", file=sys.stderr)
+    sys.exit(1)
+
+method_name = sys.argv[1]
+private_key = sys.argv[2]
+
+# Remove 0x prefix if present
+if private_key.startswith('0x'):
+    private_key = private_key[2:]
+
+# Create account
+account = Account.from_key('0x' + private_key)
+
+# Get current timestamp
+timestamp = int(time.time())
+
+# Build message: "MethodName:timestamp"
+message = f"{method_name}:{timestamp}"
+
+# Sign message (EIP-191)
+encoded_message = encode_defunct(text=message)
+signed = account.sign_message(encoded_message)
+
+# Output: signature,timestamp,address
+print(f"{signed.signature.hex()},{timestamp},{account.address}")
+PYTHON_SCRIPT
+
+chmod +x /tmp/sign_message.py
+
 echo "======================================"
-echo "GetServiceLogs Request"
+echo "ListWhitelist Request"
 echo "======================================"
 echo "Target:        $TARGET_ADDRESS"
-if [ -z "$FILE_NAME" ]; then
-    echo "Mode:          List all log files"
-else
-    echo "File:          $FILE_NAME"
-    echo "Lines:         $LINES"
-fi
 echo "======================================"
 echo ""
 
 # Generate signature
 echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "GetServiceLogs" "$PRIVATE_KEY" 2>&1)
+SIGN_OUTPUT=$(python3 "$sign_script" "ListWhitelist" "$PRIVATE_KEY" 2>&1)
 if [ $? -ne 0 ]; then
     echo "Error generating signature: $SIGN_OUTPUT"
     exit 1
@@ -315,34 +316,19 @@ echo "Timestamp: $TIMESTAMP"
 echo "======================================"
 echo ""
 
-# Build request JSON
-request_json=$(jq -n \
-    --arg file_name "$FILE_NAME" \
-    --argjson lines "$LINES" \
-    '{
-        file_name: $file_name,
-        lines: $lines
-    }')
-
-echo "Request:"
-echo "--------------------------------------"
-echo "$request_json"
-echo "--------------------------------------"
+echo "Sending ListWhitelist request..."
 echo ""
 
-echo "Sending GetServiceLogs request..."
-echo ""
-
-# Call gRPC service with signature headers
+# Call gRPC service with signature headers (empty request body)
 set +e  # Don't exit on error
-response=$(printf "%s" "$request_json" | tr -d '\n' | grpcurl -plaintext \
+response=$(grpcurl -plaintext \
     -H "x-signature: $SIGNATURE" \
     -H "x-timestamp: $TIMESTAMP" \
     -import-path "$SCRIPT_DIR/../proto" \
     -proto tapp_service.proto \
-    -d @ \
+    -d '{}' \
     "$TARGET_ADDRESS" \
-    tapp_service.TappService/GetServiceLogs 2>&1)
+    tapp_service.TappService/ListWhitelist 2>&1)
 exit_code=$?
 set -e
 
@@ -381,19 +367,23 @@ echo "$response"
 echo "--------------------------------------"
 echo ""
 
-# Check if successful and parse response
+# Parse and display whitelist addresses
 success=$(echo "$response" | jq -r '.success // empty' 2>/dev/null)
 
 if [ "$success" = "true" ]; then
-    if [ -z "$FILE_NAME" ]; then
-        echo "======================================"
-        echo "Available log files:"
-        echo "======================================"
-        echo "$response" | jq -r '.availableFiles[]? | "\(.fileName) - \(.sizeBytes) bytes - Modified: \(.modifiedTime)"' 2>/dev/null
+    echo "======================================"
+    echo "✅ Whitelisted Addresses"
+    echo "======================================"
+    
+    # Count addresses
+    address_count=$(echo "$response" | jq -r '.addresses | length' 2>/dev/null)
+    
+    if [ "$address_count" = "0" ]; then
+        echo "No addresses in whitelist"
     else
-        echo "======================================"
-        echo "✅ Log content retrieved successfully"
-        echo "======================================"
+        echo "Total: $address_count address(es)"
+        echo ""
+        echo "$response" | jq -r '.addresses[] // empty' 2>/dev/null | nl -w2 -s'. '
     fi
 else
     echo "======================================"

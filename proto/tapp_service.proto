@@ -38,6 +38,25 @@ service TappService {
 
   // Get application logs (docker compose logs)
   rpc GetAppLogs(GetAppLogsRequest) returns (GetAppLogsResponse);
+
+  // Permission Management (Owner only)
+  // Add address to whitelist
+  rpc AddToWhitelist(AddToWhitelistRequest) returns (AddToWhitelistResponse);
+
+  // Remove address from whitelist
+  rpc RemoveFromWhitelist(RemoveFromWhitelistRequest)
+      returns (RemoveFromWhitelistResponse);
+
+  // List all whitelisted addresses
+  rpc ListWhitelist(ListWhitelistRequest) returns (ListWhitelistResponse);
+
+  // App Ownership Tracking
+  // Get ownership info for a specific app
+  rpc GetAppOwnership(GetAppOwnershipRequest) returns (GetAppOwnershipResponse);
+
+  // List all app ownerships
+  rpc ListAllOwnerships(ListAllOwnershipsRequest)
+      returns (ListAllOwnershipsResponse);
 }
 
 enum LogLevel {
@@ -79,7 +98,6 @@ message StartAppRequest {
   string app_id = 2;  // Application identifier for key binding
   repeated MountFile mount_files =
       3;  // Files to mount (mapped by source_path from compose volumes)
-  bytes deployer = 4;  // 32 bytes deployer public key
 }
 
 message StartAppResponse {
@@ -106,9 +124,9 @@ message GetTaskStatusRequest {
 }
 
 message TaskResult {
-  string app_id = 1;   // Application identifier (on success)
-  bytes deployer = 2;  // 32 bytes deployer public key (on success)
-  string error = 3;    // Error message (on failure)
+  string app_id = 1;    // Application identifier (on success)
+  string deployer = 2;  // Deployer EVM address (on success)
+  string error = 3;     // Error message (on failure)
 }
 
 message GetTaskStatusResponse {
@@ -247,12 +265,13 @@ message GetServiceStatusResponse {
 // Service Logs Messages
 message GetServiceLogsRequest {
   string file_name = 1;  // Log file name (if empty, list all available files)
-  int32 lines = 2;       // Number of lines to retrieve (default: 100, tail -n behavior)
+  int32 lines =
+      2;  // Number of lines to retrieve (default: 100, tail -n behavior)
 }
 
 message LogFileInfo {
-  string file_name = 1;   // File name
-  int64 size_bytes = 2;   // File size
+  string file_name = 1;     // File name
+  int64 size_bytes = 2;     // File size
   int64 modified_time = 3;  // Last modified timestamp
 }
 
@@ -264,21 +283,84 @@ message GetServiceLogsResponse {
   repeated LogFileInfo available_files = 3;
 
   // If file_name is specified, return file content
-  string content = 4;       // File content (last N lines)
-  int32 total_lines = 5;    // Total lines returned
+  string content = 4;     // File content (last N lines)
+  int32 total_lines = 5;  // Total lines returned
 }
 
 // Application Logs Messages
 message GetAppLogsRequest {
-  string app_id = 1;          // Application identifier
-  int32 lines = 2;            // Number of lines to retrieve (default: 100)
-  string service_name = 3;    // Optional: specific service in compose (e.g., "web", "broker")
+  string app_id = 1;  // Application identifier
+  int32 lines = 2;    // Number of lines to retrieve (default: 100)
+  string service_name =
+      3;  // Optional: specific service in compose (e.g., "web", "broker")
 }
 
 message GetAppLogsResponse {
   bool success = 1;
   string message = 2;
-  string content = 3;         // Log content from docker compose logs
-  int32 total_lines = 4;      // Total lines returned
+  string content = 3;     // Log content from docker compose logs
+  int32 total_lines = 4;  // Total lines returned
 }
 
+// Permission Management Messages
+message AddToWhitelistRequest {
+  string evm_address = 1;  // EVM address to add (e.g., "0xabcd...")
+}
+
+message AddToWhitelistResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RemoveFromWhitelistRequest {
+  string evm_address = 1;  // EVM address to remove
+}
+
+message RemoveFromWhitelistResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListWhitelistRequest {
+  // No parameters needed
+}
+
+message ListWhitelistResponse {
+  bool success = 1;
+  string message = 2;
+  repeated string addresses = 3;  // List of whitelisted EVM addresses
+}
+
+// App Ownership Messages
+enum AppStatus {
+  ACTIVE = 0;
+  STOPPED = 1;
+}
+
+message AppOwnershipInfo {
+  string app_id = 1;
+  string owner_address = 2;  // EVM address of the app owner (who started it)
+  int64 started_at = 3;      // Unix timestamp when app was started
+  AppStatus status = 4;      // Current app status
+  int64 stopped_at = 5;  // Unix timestamp when app was stopped (0 if running)
+}
+
+message GetAppOwnershipRequest {
+  string app_id = 1;
+}
+
+message GetAppOwnershipResponse {
+  bool success = 1;
+  string message = 2;
+  AppOwnershipInfo ownership = 3;  // Ownership info (null if not found)
+}
+
+message ListAllOwnershipsRequest {
+  // No parameters needed
+}
+
+message ListAllOwnershipsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated AppOwnershipInfo ownerships = 3;  // List of all app ownerships
+}

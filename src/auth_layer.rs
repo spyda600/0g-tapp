@@ -1,47 +1,71 @@
-use crate::config::ApiKeyConfig;
+use crate::config::PermissionConfig;
+use crate::permission::{Permission, PermissionManager};
+use crate::signature_auth::{build_sign_message, recover_evm_address, verify_timestamp};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tonic::body::BoxBody;
 use tonic::Status;
 use tower::{Layer, Service};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-/// Tower Layer for API key authentication
-/// This wraps the entire gRPC service and can access method paths
+/// Tower Layer for signature-based authentication
+/// This wraps the entire gRPC service and validates EVM signatures
 #[derive(Clone)]
-pub struct ApiKeyLayer {
-    config: Option<ApiKeyConfig>,
+pub struct AuthLayer {
+    permission_manager: Option<Arc<PermissionManager>>,
+    enabled: bool,
 }
 
-impl ApiKeyLayer {
-    pub fn new(config: Option<ApiKeyConfig>) -> Self {
-        Self { config }
+impl AuthLayer {
+    pub fn new(config: Option<PermissionConfig>) -> Self {
+        let (permission_manager, enabled) = if let Some(cfg) = config {
+            if cfg.enabled {
+                let pm = PermissionManager::new(cfg.owner_address.clone());
+                (Some(Arc::new(pm)), true)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+
+        Self {
+            permission_manager,
+            enabled,
+        }
     }
-}
 
-impl<S> Layer<S> for ApiKeyLayer {
-    type Service = ApiKeyMiddleware<S>;
-
-    fn layer(&self, service: S) -> Self::Service {
-        ApiKeyMiddleware {
-            inner: service,
-            config: self.config.clone(),
+    pub fn with_permission_manager(permission_manager: Arc<PermissionManager>) -> Self {
+        Self {
+            permission_manager: Some(permission_manager),
+            enabled: true,
         }
     }
 }
 
-/// Middleware that performs API key validation
-#[derive(Clone)]
-pub struct ApiKeyMiddleware<S> {
-    inner: S,
-    config: Option<ApiKeyConfig>,
+impl<S> Layer<S> for AuthLayer {
+    type Service = AuthMiddleware<S>;
+
+    fn layer(&self, service: S) -> Self::Service {
+        AuthMiddleware {
+            inner: service,
+            permission_manager: self.permission_manager.clone(),
+            enabled: self.enabled,
+        }
+    }
 }
 
-impl<S> Service<http::Request<BoxBody>> for ApiKeyMiddleware<S>
+/// Middleware that performs signature validation and permission checks
+#[derive(Clone)]
+pub struct AuthMiddleware<S> {
+    inner: S,
+    permission_manager: Option<Arc<PermissionManager>>,
+    enabled: bool,
+}
+
+impl<S> Service<http::Request<BoxBody>> for AuthMiddleware<S>
 where
-    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>>
-        + Clone
-        + Send
-        + 'static,
+    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>> + Clone + Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
     S::Future: Send + 'static,
 {
@@ -53,25 +77,100 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<BoxBody>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<BoxBody>) -> Self::Future {
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        let config = self.config.clone();
+        let permission_manager = self.permission_manager.clone();
+        let enabled = self.enabled;
 
         Box::pin(async move {
             // Extract method name from URI path
             // gRPC method path format: /package.Service/Method
             let path = req.uri().path();
-            let method_name = path.split('/').last().unwrap_or("Unknown");
+            let method_name = path.split('/').last().unwrap_or("Unknown").to_string();
 
-            debug!(method = %method_name, path = %path, "API key validation");
+            debug!(
+                method = %method_name,
+                path = %path,
+                "Processing authentication"
+            );
 
-            // Validate API key if configured
-            if let Err(status) = validate_request(&config, &req, method_name) {
-                // Convert Status to HTTP response
-                let response = status.into_http();
+            // If auth is not enabled, allow all requests
+            if !enabled || permission_manager.is_none() {
+                debug!("Authentication disabled, allowing request");
+                return inner.call(req).await;
+            }
+
+            let pm = permission_manager.as_ref().unwrap();
+
+            // Check if method requires authentication
+            let method_permission = get_method_permission(&method_name);
+
+            // Public methods don't require authentication
+            if method_permission == MethodPermission::Public {
+                debug!(method = %method_name, "Public method, no auth required");
+                return inner.call(req).await;
+            }
+
+            // Extract headers needed for validation
+            let signature = req
+                .headers()
+                .get("x-signature")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            let timestamp_str = req
+                .headers()
+                .get("x-timestamp")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Validate signature
+            let signer_address = match validate_signature(signature, timestamp_str, &method_name) {
+                Ok(addr) => addr,
+                Err(status) => {
+                    let response = status.into_http();
+                    return Ok(response);
+                }
+            };
+
+            // Get user permission level
+            let user_permission = pm.get_permission(&signer_address).await;
+
+            debug!(
+                method = %method_name,
+                signer = %signer_address,
+                permission = ?user_permission,
+                "User permission determined"
+            );
+
+            // Check if user has required permission for this method
+            if !is_authorized(&method_permission, &user_permission) {
+                warn!(
+                    method = %method_name,
+                    signer = %signer_address,
+                    required = ?method_permission,
+                    actual = ?user_permission,
+                    event = "AUTH_INSUFFICIENT_PERMISSION",
+                    "Insufficient permission"
+                );
+                let response =
+                    Status::permission_denied("Insufficient permission for this operation")
+                        .into_http();
                 return Ok(response);
             }
+
+            info!(
+                method = %method_name,
+                signer = %signer_address,
+                permission = ?user_permission,
+                event = "AUTH_SUCCESS",
+                "Authentication and authorization successful"
+            );
+
+            // Inject signer address into request extensions for business layer
+            req.extensions_mut()
+                .insert(SignerAddress(signer_address.clone()));
 
             // Call the inner service
             inner.call(req).await
@@ -79,67 +178,146 @@ where
     }
 }
 
-/// Validate the request based on API key configuration
-fn validate_request(
-    config: &Option<ApiKeyConfig>,
-    req: &http::Request<BoxBody>,
+/// Extract signer address from request extensions
+pub fn get_signer_address<T>(req: &tonic::Request<T>) -> Option<String> {
+    req.extensions().get::<SignerAddress>().map(|s| s.0.clone())
+}
+
+/// Wrapper type for signer address stored in request extensions
+#[derive(Clone, Debug)]
+pub struct SignerAddress(pub String);
+
+// ============================================================================
+// Permission and authorization logic
+// ============================================================================
+
+/// Method permission requirements
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MethodPermission {
+    Public,           // No auth required
+    OwnerOnly,        // Only tapp owner
+    OwnerOrWhitelist, // Owner or whitelisted users
+    OwnerOrAppOwner,  // Owner or app owner (checked in business layer)
+}
+
+/// Get permission requirement for a method
+fn get_method_permission(method_name: &str) -> MethodPermission {
+    match method_name {
+        // Public methods (no authentication required)
+        "GetEvidence"
+        | "GetAppKey"
+        | "GetAppInfo"
+        | "ListAppMeasurements"
+        | "GetTaskStatus"
+        | "GetServiceStatus" => MethodPermission::Public,
+
+        // Owner-only methods
+        "AddToWhitelist" | "RemoveFromWhitelist" | "ListWhitelist" | "ListAllOwnerships" => {
+            MethodPermission::OwnerOnly
+        }
+
+        // Owner or whitelist methods
+        "StartApp" => MethodPermission::OwnerOrWhitelist,
+
+        // Owner or app owner (ownership checked in business layer)
+        "StopApp" | "GetAppSecretKey" | "GetAppLogs" | "GetAppOwnership" => {
+            MethodPermission::OwnerOrAppOwner
+        }
+
+        // Service logs - owner only
+        "GetServiceLogs" => MethodPermission::OwnerOnly,
+
+        // Default: require owner permission
+        _ => {
+            warn!(method = %method_name, "Unknown method, defaulting to OwnerOnly");
+            MethodPermission::OwnerOnly
+        }
+    }
+}
+
+/// Check if user has required permission
+fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
+    match required {
+        MethodPermission::Public => true,
+        MethodPermission::OwnerOnly => *actual == Permission::Owner,
+        MethodPermission::OwnerOrWhitelist => {
+            *actual == Permission::Owner || *actual == Permission::Whitelist
+        }
+        MethodPermission::OwnerOrAppOwner => {
+            // Allow owner and whitelist through
+            // Actual app ownership check happens in business layer
+            *actual == Permission::Owner || *actual == Permission::Whitelist
+        }
+    }
+}
+
+/// Validate signature and return signer address
+fn validate_signature(
+    signature: Option<String>,
+    timestamp_str: Option<String>,
     method_name: &str,
-) -> Result<(), Status> {
-    // If API key auth is not configured or disabled, allow all requests
-    let Some(api_config) = config else {
-        return Ok(());
-    };
-
-    if !api_config.enabled {
-        return Ok(());
-    }
-
-    // Check if this method requires authentication
-    let requires_auth = if api_config.protected_methods.is_empty() {
-        // If empty, all methods require auth
-        true
-    } else {
-        // Check if current method is in the protected list
-        api_config
-            .protected_methods
-            .iter()
-            .any(|m| m == method_name)
-    };
-
-    if !requires_auth {
-        debug!(method = %method_name, "Method does not require API key");
-        return Ok(());
-    }
-
-    // Extract API key from headers (gRPC metadata becomes HTTP headers)
-    let api_key = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            warn!(
-                method = %method_name,
-                event = "AUTH_MISSING_API_KEY",
-                "API key missing in request"
-            );
-            Status::unauthenticated("Missing API key. Please provide 'x-api-key' in metadata")
-        })?;
-
-    // Validate API key
-    if !api_config.keys.contains(&api_key.to_string()) {
+) -> Result<String, Status> {
+    // Check signature
+    let sig = signature.ok_or_else(|| {
         warn!(
             method = %method_name,
-            event = "AUTH_INVALID_API_KEY",
-            "Invalid API key attempted"
+            event = "AUTH_MISSING_SIGNATURE",
+            "Signature missing in request"
         );
-        return Err(Status::permission_denied("Invalid API key"));
+        Status::unauthenticated("Missing signature. Please provide 'x-signature' in metadata")
+    })?;
+
+    let ts_str = timestamp_str.ok_or_else(|| {
+        warn!(
+            method = %method_name,
+            event = "AUTH_MISSING_TIMESTAMP",
+            "Timestamp missing in request"
+        );
+        Status::unauthenticated("Missing timestamp. Please provide 'x-timestamp' in metadata")
+    })?;
+
+    let timestamp: i64 = ts_str.parse().map_err(|_| {
+        warn!(
+            method = %method_name,
+            timestamp = %ts_str,
+            event = "AUTH_INVALID_TIMESTAMP",
+            "Invalid timestamp format"
+        );
+        Status::invalid_argument("Invalid timestamp format")
+    })?;
+
+    // Verify timestamp is within acceptable window
+    if !verify_timestamp(timestamp).unwrap_or(false) {
+        warn!(
+            method = %method_name,
+            timestamp = %timestamp,
+            event = "AUTH_TIMESTAMP_EXPIRED",
+            "Timestamp outside acceptable window"
+        );
+        return Err(Status::unauthenticated(
+            "Timestamp outside acceptable window (±5 minutes)",
+        ));
     }
+
+    // Build the message that should have been signed
+    let message = build_sign_message(method_name, timestamp);
+
+    // Recover signer address from signature
+    let signer_address = recover_evm_address(&message, &sig).map_err(|e| {
+        warn!(
+            method = %method_name,
+            error = %e,
+            event = "AUTH_SIGNATURE_RECOVERY_FAILED",
+            "Failed to recover signer address"
+        );
+        Status::unauthenticated(format!("Invalid signature: {}", e))
+    })?;
 
     debug!(
         method = %method_name,
-        event = "AUTH_SUCCESS",
-        "API key validation successful"
+        signer = %signer_address,
+        "Successfully recovered signer address"
     );
 
-    Ok(())
+    Ok(signer_address)
 }

@@ -4,7 +4,9 @@ pub mod boot;
 pub mod config;
 pub mod error;
 pub mod nonce_manager;
+pub mod permission;
 pub mod service_monitor;
+pub mod signature_auth;
 pub mod utils;
 pub use boot::BootService;
 pub use config::TappConfig;
@@ -35,6 +37,7 @@ pub struct TappServiceImpl {
     pub app_key_service: app_key::AppKeyService,
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
+    pub permission_manager: Option<Arc<permission::PermissionManager>>,
 }
 
 impl TappServiceImpl {
@@ -80,20 +83,21 @@ impl TappServiceImpl {
         }
     }
 
-    pub async fn new(config: TappConfig) -> TappResult<Self> {
+    pub async fn new(
+        config: TappConfig,
+        permission_manager: Option<Arc<permission::PermissionManager>>,
+    ) -> TappResult<Self> {
         info!("Initializing TAPP service components");
         let boot_service = Arc::new(BootService::new(&config.boot).await?);
 
         // Initialize AppKeyService
-        // If KBS config is not provided, use in-memory mode
-        let (kbs_config, use_in_memory) = if let Some(ref kbs) = config.kbs {
-            (kbs.clone(), false)
+        let app_key_service = if let Some(ref kbs) = config.kbs {
+            info!("Using KBS for app key management");
+            app_key::AppKeyService::new(Some(kbs), false).await?
         } else {
             info!("KBS config not provided, using in-memory key generation");
-            (config::KbsConfig::default(), true)
+            app_key::AppKeyService::new(None, true).await?
         };
-
-        let app_key_service = app_key::AppKeyService::new(&kbs_config, use_in_memory).await?;
 
         // Initialize NonceManager for replay attack prevention
         let nonce_manager = nonce_manager::NonceManager::new();
@@ -109,6 +113,7 @@ impl TappServiceImpl {
             app_key_service,
             nonce_manager,
             logs_service,
+            permission_manager,
             config,
         })
     }
@@ -130,9 +135,41 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<StartAppRequest>,
     ) -> Result<Response<StartAppResponse>, Status> {
-        // API key validation is handled by ApiKeyLayer - no code needed here!
-        let req = request.into_inner();
-        let response = self.boot_service.clone().start_app(req).await?;
+        // Signature validation is handled by AuthLayer
+        // Get signer address before consuming request
+        let signer = auth_layer::get_signer_address(&request);
+        let req_inner = request.into_inner();
+        let app_id = req_inner.app_id.clone();
+
+        // Get deployer address (signer EVM address)
+        // If no signer (auth disabled), use a default placeholder
+        let deployer = signer
+            .clone()
+            .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+
+        // Start the app with deployer address
+        let response = self
+            .boot_service
+            .clone()
+            .start_app(req_inner, deployer.clone())
+            .await?;
+
+        // Record ownership if permission management is enabled
+        if let Some(pm) = &self.permission_manager {
+            if let Some(signer_addr) = signer {
+                pm.record_app_start(app_id.clone(), signer_addr.clone())
+                    .await;
+
+                info!(
+                    app_id = %app_id,
+                    owner = %signer_addr,
+                    deployer = %deployer,
+                    event = "APP_OWNERSHIP_RECORDED",
+                    "App ownership recorded"
+                );
+            }
+        }
+
         Ok(Response::new(response))
     }
 
@@ -140,11 +177,48 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<StopAppRequest>,
     ) -> Result<Response<StopAppResponse>, Status> {
-        let req = request.into_inner();
-        self.boot_service.stop_app(&req.app_id).await?;
+        // Get signer address before consuming request
+        let signer = auth_layer::get_signer_address(&request);
+        let req_inner = request.into_inner();
+        let app_id = req_inner.app_id.clone();
+
+        // Check ownership if permission management is enabled
+        if let Some(pm) = &self.permission_manager {
+            if let Some(signer_addr) = signer {
+                // Check if user can manage this app
+                if !pm.can_manage_app(&app_id, &signer_addr).await {
+                    return Err(Status::permission_denied(format!(
+                        "You don't have permission to stop app {}. Only the app owner or tapp owner can stop it.",
+                        app_id
+                    )));
+                }
+
+                info!(
+                    app_id = %app_id,
+                    requester = %signer_addr,
+                    event = "APP_STOP_AUTHORIZED",
+                    "User authorized to stop app"
+                );
+            }
+        }
+
+        // Stop the app
+        self.boot_service.stop_app(&app_id).await?;
+
+        // Mark app as stopped in ownership tracking
+        if let Some(pm) = &self.permission_manager {
+            pm.mark_app_stopped(&app_id).await;
+
+            info!(
+                app_id = %app_id,
+                event = "APP_OWNERSHIP_UPDATED",
+                "App marked as stopped"
+            );
+        }
+
         Ok(Response::new(StopAppResponse {
             success: true,
-            message: format!("Application {} stopped successfully", req.app_id),
+            message: format!("Application {} stopped successfully", app_id),
             timestamp: utils::current_timestamp(),
         }))
     }
@@ -460,6 +534,189 @@ impl TappService for TappServiceImpl {
             message: format!("Retrieved {} lines from app {}", total_lines, req.app_id),
             content,
             total_lines,
+        }))
+    }
+
+    // ============================================================================
+    // Permission Management Methods
+    // ============================================================================
+
+    async fn add_to_whitelist(
+        &self,
+        request: Request<AddToWhitelistRequest>,
+    ) -> Result<Response<AddToWhitelistResponse>, Status> {
+        let req = request.into_inner();
+
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        // Add address to whitelist
+        pm.add_to_whitelist(req.evm_address.clone())
+            .await
+            .map_err(|e| Status::internal(format!("Failed to add to whitelist: {}", e)))?;
+
+        // Extend runtime measurement for this security-critical operation
+        let measurement_data = serde_json::json!({
+            "operation": "add_to_whitelist",
+            "address": req.evm_address,
+            "timestamp": utils::current_timestamp()
+        })
+        .to_string();
+
+        self.boot_service
+            .extend_permission_measurement(boot::OPERATION_NAME_ADD_TO_WHITELIST, &measurement_data)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to extend measurement: {}", e)))?;
+
+        info!(
+            address = %req.evm_address,
+            event = "WHITELIST_ADDED",
+            "Address added to whitelist and measurement extended"
+        );
+
+        Ok(Response::new(AddToWhitelistResponse {
+            success: true,
+            message: format!("Address {} added to whitelist", req.evm_address),
+        }))
+    }
+
+    async fn remove_from_whitelist(
+        &self,
+        request: Request<RemoveFromWhitelistRequest>,
+    ) -> Result<Response<RemoveFromWhitelistResponse>, Status> {
+        let req = request.into_inner();
+
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        // Remove address from whitelist
+        pm.remove_from_whitelist(&req.evm_address)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to remove from whitelist: {}", e)))?;
+
+        // Extend runtime measurement for this security-critical operation
+        let measurement_data = serde_json::json!({
+            "operation": "remove_from_whitelist",
+            "address": req.evm_address,
+            "timestamp": utils::current_timestamp()
+        })
+        .to_string();
+
+        self.boot_service
+            .extend_permission_measurement(
+                boot::OPERATION_NAME_REMOVE_FROM_WHITELIST,
+                &measurement_data,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to extend measurement: {}", e)))?;
+
+        info!(
+            address = %req.evm_address,
+            event = "WHITELIST_REMOVED",
+            "Address removed from whitelist and measurement extended"
+        );
+
+        Ok(Response::new(RemoveFromWhitelistResponse {
+            success: true,
+            message: format!("Address {} removed from whitelist", req.evm_address),
+        }))
+    }
+
+    async fn list_whitelist(
+        &self,
+        _request: Request<ListWhitelistRequest>,
+    ) -> Result<Response<ListWhitelistResponse>, Status> {
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        let addresses = pm.list_whitelist().await;
+
+        Ok(Response::new(ListWhitelistResponse {
+            success: true,
+            message: format!("Found {} whitelisted address(es)", addresses.len()),
+            addresses,
+        }))
+    }
+
+    async fn get_app_ownership(
+        &self,
+        request: Request<GetAppOwnershipRequest>,
+    ) -> Result<Response<GetAppOwnershipResponse>, Status> {
+        // Get signer address before consuming request
+        let signer = auth_layer::get_signer_address(&request)
+            .ok_or_else(|| Status::unauthenticated("Signer address not found"))?;
+
+        let req = request.into_inner();
+
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        // Check if user can view this app's ownership
+        // Owner can view all, others can only view if they can manage the app
+        if !pm.can_manage_app(&req.app_id, &signer).await && signer != pm.get_tapp_owner_address() {
+            return Err(Status::permission_denied(
+                "You don't have permission to view this app's ownership",
+            ));
+        }
+
+        let ownership = pm.get_app_ownership(&req.app_id).await;
+
+        match ownership {
+            Some(own) => Ok(Response::new(GetAppOwnershipResponse {
+                success: true,
+                message: format!("Ownership info for app {}", req.app_id),
+                ownership: Some(AppOwnershipInfo {
+                    app_id: own.app_id,
+                    owner_address: own.owner_address,
+                    started_at: own.started_at,
+                    status: match own.status {
+                        permission::AppStatus::Active => proto::AppStatus::Active.into(),
+                        permission::AppStatus::Stopped => proto::AppStatus::Stopped.into(),
+                    },
+                    stopped_at: own.stopped_at.unwrap_or(0),
+                }),
+            })),
+            None => Err(Status::not_found(format!("App {} not found", req.app_id))),
+        }
+    }
+
+    async fn list_all_ownerships(
+        &self,
+        _request: Request<ListAllOwnershipsRequest>,
+    ) -> Result<Response<ListAllOwnershipsResponse>, Status> {
+        let pm = self
+            .permission_manager
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Permission management not enabled"))?;
+
+        let ownerships_list = pm.list_all_ownerships().await;
+
+        let ownerships: Vec<AppOwnershipInfo> = ownerships_list
+            .into_iter()
+            .map(|own| AppOwnershipInfo {
+                app_id: own.app_id,
+                owner_address: own.owner_address,
+                started_at: own.started_at,
+                status: match own.status {
+                    permission::AppStatus::Active => proto::AppStatus::Active.into(),
+                    permission::AppStatus::Stopped => proto::AppStatus::Stopped.into(),
+                },
+                stopped_at: own.stopped_at.unwrap_or(0),
+            })
+            .collect();
+
+        Ok(Response::new(ListAllOwnershipsResponse {
+            success: true,
+            message: format!("Found {} app ownership(s)", ownerships.len()),
+            ownerships,
         }))
     }
 }

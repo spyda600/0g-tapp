@@ -21,7 +21,7 @@ struct EthKeyPair {
 
 /// Application key service implementation
 pub struct AppKeyService {
-    kbs_client: KbsClient,
+    kbs_client: Option<KbsClient>,
     /// In-memory key storage: app_id -> EthKeyPair
     app_keys: Mutex<HashMap<String, EthKeyPair>>,
     /// Whether to use in-memory keys (if false, use KBS)
@@ -30,12 +30,21 @@ pub struct AppKeyService {
 
 impl AppKeyService {
     /// Create new app key service
-    pub async fn new(config: &KbsConfig, use_in_memory: bool) -> TappResult<Self> {
-        let kbs_client = KbsClient::new(&config.endpoint).await?;
+    pub async fn new(
+        kbs_config: Option<&KbsConfig>, // ← 改为 Option
+        use_in_memory: bool,
+    ) -> TappResult<Self> {
+        let kbs_client = if let Some(config) = kbs_config {
+            info!(endpoint = %config.endpoint, "Initializing KBS client");
+            Some(KbsClient::new(&config.endpoint).await?)
+        } else {
+            info!("KBS client not initialized (in-memory mode)");
+            None
+        };
 
         info!(
             use_in_memory = use_in_memory,
-            kbs_endpoint = %config.endpoint,
+            has_kbs_client = kbs_client.is_some(),
             "Initialized app key service"
         );
 
@@ -163,8 +172,16 @@ impl AppKeyService {
             }
         } else {
             // Use KBS
+            let kbs_client =
+                self.kbs_client
+                    .as_ref()
+                    .ok_or_else(|| DockerError::ContainerOperationFailed {
+                        operation: "get_app_key".to_string(),
+                        reason: "KBS client not configured".to_string(),
+                    })?;
+
             let resource_uri = format!("kbs:///default/key/{}", app_id);
-            match self.kbs_client.get_resource(&resource_uri).await {
+            match kbs_client.get_resource(&resource_uri).await {
                 Ok(key_data) => Ok(GetAppKeyResponse {
                     success: true,
                     message: format!("Key from KBS for app {}", app_id),

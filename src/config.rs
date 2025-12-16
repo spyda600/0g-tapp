@@ -102,25 +102,26 @@ pub struct ServerConfig {
     /// TLS private key path (if TLS enabled)
     pub tls_key_path: Option<PathBuf>,
 
-    /// API Key configuration for authentication
+    /// Permission configuration for signature-based authentication
     #[serde(default)]
-    pub api_key: Option<ApiKeyConfig>,
+    pub permission: Option<PermissionConfig>,
 }
 
-/// API Key authentication configuration
+/// Permission-based authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeyConfig {
-    /// Enable API key authentication
+pub struct PermissionConfig {
+    /// Enable permission-based authentication
     #[serde(default)]
     pub enabled: bool,
 
-    /// List of valid API keys (in production, use env vars or secrets management)
-    pub keys: Vec<String>,
+    /// Tapp owner EVM address (has full control)
+    /// Example: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+    pub owner_address: String,
 
-    /// Methods that require authentication (if empty, all methods require auth)
-    /// Examples: "StartApp", "GetAppSecretKey"
+    /// Initial whitelist of EVM addresses allowed to start apps
+    /// Example: ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
     #[serde(default)]
-    pub protected_methods: Vec<String>,
+    pub initial_whitelist: Vec<String>,
 }
 
 /// KBS configuration
@@ -243,7 +244,7 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
-            api_key: None,
+            permission: None,
         }
     }
 }

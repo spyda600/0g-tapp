@@ -1,42 +1,196 @@
 #!/bin/bash
 
+# Get application information from TAPP service
 # Usage:
-#   ./get_app_info.sh [HOST] [PORT] [APP_ID]
+#   ./get_app_info.sh [OPTIONS]
 #
 # Examples:
-#   ./get_app_info.sh your-cvm-instance-host 50051 test-nginx-app
+#   ./get_app_info.sh --host 39.97.63.199 --port 50051 --app-id test-nginx-app
+#   ./get_app_info.sh --host 39.97.63.199 --app-id my-app
+#   APP_ID=my-app ./get_app_info.sh --host 39.97.63.199
+
+set -e
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default configuration
-DEFAULT_HOST="your-cvm-instance-host"
+DEFAULT_HOST="localhost"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID="test-nginx-app"
 
 # Parse command line arguments
-APP_ID=${1:-$DEFAULT_APP_ID}
-TARGET_HOST=${2:-$DEFAULT_HOST}
-TARGET_PORT=${3:-$DEFAULT_PORT}
+TARGET_HOST="$DEFAULT_HOST"
+TARGET_PORT="$DEFAULT_PORT"
+APP_ID=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --host)
+            TARGET_HOST="$2"
+            shift 2
+            ;;
+        --port)
+            TARGET_PORT="$2"
+            shift 2
+            ;;
+        --app-id)
+            APP_ID="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --host HOST             gRPC server host (default: $DEFAULT_HOST)"
+            echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
+            echo "  --app-id APP_ID         Application ID to query (default: $DEFAULT_APP_ID)"
+            echo "  --help, -h              Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0 --host 39.97.63.199 --port 50051 --app-id test-nginx-app"
+            echo "  $0 --host 39.97.63.199 --app-id my-app"
+            echo ""
+            echo "Environment variable:"
+            echo "  APP_ID=my-app $0 --host 39.97.63.199"
+            echo ""
+            echo "Legacy positional format also supported:"
+            echo "  $0 test-nginx-app 39.97.63.199 50051"
+            exit 0
+            ;;
+        *)
+            # Support legacy positional arguments for backward compatibility
+            # Original order was: APP_ID HOST PORT
+            if [ -z "$APP_ID" ]; then
+                APP_ID="$1"
+            elif [ "$TARGET_HOST" = "$DEFAULT_HOST" ]; then
+                TARGET_HOST="$1"
+            elif [ "$TARGET_PORT" = "$DEFAULT_PORT" ]; then
+                TARGET_PORT="$1"
+            else
+                echo "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
+# App ID priority: command line arg > environment variable > default
+if [ -z "$APP_ID" ] && [ -n "$APP_ID_ENV" ]; then
+    APP_ID="$APP_ID_ENV"
+elif [ -z "$APP_ID" ]; then
+    APP_ID="$DEFAULT_APP_ID"
+fi
+
+# Validate app ID (not empty)
+if [ -z "$APP_ID" ]; then
+    echo "Error: Application ID cannot be empty"
+    echo ""
+    echo "Usage: $0 --host HOST --port PORT --app-id APP_ID"
+    echo "Use --help for more information"
+    exit 1
+fi
+
+# Quick dependency check
+missing_deps=()
+
+if ! command -v grpcurl &> /dev/null; then
+    missing_deps+=("grpcurl")
+fi
+
+if ! command -v jq &> /dev/null; then
+    missing_deps+=("jq")
+fi
+
+# Check proto file
+proto_file="$SCRIPT_DIR/../proto/tapp_service.proto"
+if [ ! -f "$proto_file" ]; then
+    missing_deps+=("tapp_service.proto")
+fi
+
+if [ ${#missing_deps[@]} -gt 0 ]; then
+    echo "❌ Missing dependencies: ${missing_deps[*]}"
+    echo ""
+    for dep in "${missing_deps[@]}"; do
+        case "$dep" in
+            "grpcurl")
+                echo "• grpcurl: https://github.com/fullstorydev/grpcurl/releases"
+                ;;
+            "jq")
+                echo "• jq: https://stedolan.github.io/jq/download/"
+                ;;
+            "tapp_service.proto")
+                echo "• proto file not found at: $proto_file"
+                ;;
+        esac
+    done
+    exit 1
+fi
+
+# Display configuration
+echo "======================================"
+echo "GetAppInfo Request"
+echo "======================================"
+echo "Target:             $TARGET_ADDRESS"
+echo "App ID:             $APP_ID"
+echo "======================================"
+echo ""
+
+echo "Querying app info..."
+echo ""
+
+# Build request JSON
 request_json=$(jq -n \
   --arg app_id "$APP_ID" \
   '{
     app_id: $app_id
   }')
 
-echo "Querying app info..."
-echo ""
-
 echo "Request:"
 echo "--------------------------------------"
 echo "$request_json"
 echo "--------------------------------------"
+echo ""
 
-response=$(printf "%s" "$request_json" | tr -d '\n' | grpcurl -plaintext \
-  -import-path ./proto \
+# Call gRPC service
+response=$(grpcurl -plaintext \
+  -import-path "$SCRIPT_DIR/../proto" \
   -proto tapp_service.proto \
-  -d @ \
+  -d "{
+    \"app_id\": \"$APP_ID\"
+  }" \
   "$TARGET_ADDRESS" \
   tapp_service.TappService/GetAppInfo 2>&1)
+
+# Debug: Show raw response length
+response_length=${#response}
+echo "Debug: Raw response length = $response_length bytes"
+echo ""
+
+# Check if request was successful
+if echo "$response" | grep -q "Code:"; then
+    echo "❌ Request failed:"
+    echo "--------------------------------------"
+    echo "$response"
+    echo "--------------------------------------"
+    exit 1
+fi
+
+# Check if response is empty
+if [ -z "$response" ] || [ "$response_length" -lt 3 ]; then
+    echo "⚠️  Empty response received from server"
+    echo "This could mean:"
+    echo "  • The application '$APP_ID' does not exist"
+    echo "  • The server returned an empty response (no error, no data)"
+    echo "  • Network/connection issue"
+    echo ""
+    echo "Raw response: '$response'"
+    exit 0
+fi
 
 echo "Response:"
 echo "--------------------------------------"

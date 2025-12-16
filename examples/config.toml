@@ -1,8 +1,8 @@
 # TAPP Service Configuration Example
 
 [logging]
-level = "info"              # Log level: "trace", "debug", "info", "warn", "error"
-format = "json"             # Log format: "json" or "pretty"
+level = "info"  # Log level: "trace", "debug", "info", "warn", "error"
+format = "json" # Log format: "json" or "pretty"
 # file_path = "/var/log/tapp/app.log"  # Optional: log to file
 max_file_size_mb = 100
 max_files = 10
@@ -15,23 +15,11 @@ tls_enabled = false
 # tls_cert_path = "/path/to/cert.pem"
 # tls_key_path = "/path/to/key.pem"
 
-# API Key Authentication Configuration
-[server.api_key]
+# Permission-based Authentication Configuration
+[server.permission]
 enabled = true
-# List of valid API keys
-# IMPORTANT: In production, use environment variables or secrets management
-# instead of hardcoding keys in config files
-keys = [
-    "your-api-key-here",
-    "another-api-key-for-different-client"
-]
-# Specify which methods require authentication
-# If empty, ALL methods will require API key
-# Example: only protect sensitive operations
-protected_methods = [
-    "StartApp",
-    "GetAppSecretKey"
-]
+owner_address = "0xea695C312CE119dE347425B29AFf85371c9d1837"
+initial_whitelist = ["0x0E552ac14124F6f336a4504Aa72c921b4D7F8032"]
 
 [boot]
 # aa_config_path = "/etc/tapp/attestation-agent.toml"

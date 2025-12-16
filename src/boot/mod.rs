@@ -18,6 +18,8 @@ use tracing::info;
 pub const ZGEL_DOMAIN: &str = "tapp.0g.com";
 pub const OPERATION_NAME_START_APP: &str = "start_app";
 pub const OPERATION_NAME_STOP_APP: &str = "stop_app";
+pub const OPERATION_NAME_ADD_TO_WHITELIST: &str = "add_to_whitelist";
+pub const OPERATION_NAME_REMOVE_FROM_WHITELIST: &str = "remove_from_whitelist";
 
 pub struct BootService {
     config: BootServiceConfig,
@@ -90,7 +92,7 @@ enable_eventlog = true
     }
 
     /// Internal method to handle the actual app start logic
-    async fn _start_app(&self, request: StartAppRequest, task_id: String) {
+    async fn _start_app(&self, request: StartAppRequest, deployer: String, task_id: String) {
         let result = async {
             let app_id = request.app_id.clone();
             if self.app_measurements.lock().await.contains_key(&app_id) {
@@ -125,7 +127,7 @@ enable_eventlog = true
 
             // Calculate application measurement
             let (measurement, compose_content, volumes_content) = self
-                .calculate_app_measurement(&request, &mount_files, &app_id)
+                .calculate_app_measurement(&request, &mount_files, &app_id, &deployer)
                 .await?;
 
             let measurement_json = serde_json::to_string(&measurement)?;
@@ -168,7 +170,7 @@ enable_eventlog = true
                 "Application started successfully"
             );
 
-            Ok::<_, crate::error::TappError>((app_id, request.deployer))
+            Ok::<_, crate::error::TappError>((app_id, deployer.clone()))
         }
         .await;
 
@@ -192,6 +194,7 @@ enable_eventlog = true
     pub async fn start_app(
         self: std::sync::Arc<Self>,
         request: StartAppRequest,
+        deployer: String, // EVM address from signature authentication
     ) -> TappResult<StartAppResponse> {
         // Validate request
         self.validate_request(&request)?;
@@ -215,7 +218,7 @@ enable_eventlog = true
 
         // Spawn background task
         tokio::spawn(async move {
-            service._start_app(request, task_id_clone).await;
+            service._start_app(request, deployer, task_id_clone).await;
         });
 
         Ok(StartAppResponse {
@@ -338,13 +341,6 @@ enable_eventlog = true
             .into());
         }
 
-        if request.deployer.len() != 64 {
-            return Err(DockerError::InvalidComposeContent {
-                reason: "Deployer must be 64 bytes".to_string(),
-            }
-            .into());
-        }
-
         Ok(())
     }
 
@@ -354,6 +350,7 @@ enable_eventlog = true
         request: &StartAppRequest,
         mount_files: &[MountFile],
         app_id: &str,
+        deployer: &str, // EVM address from signature
     ) -> TappResult<(AppMeasurement, String, String)> {
         let measurement = ComposeMeasurement::new();
 
@@ -374,7 +371,7 @@ enable_eventlog = true
                 app_id: app_id.to_string(),
                 compose_hash,
                 volumes_hash,
-                deployer: hex::encode(request.deployer.clone()),
+                deployer: deployer.to_string(), // Use EVM address directly
                 timestamp: crate::utils::current_timestamp(),
             },
             request.compose_content.clone(),
@@ -433,6 +430,28 @@ enable_eventlog = true
         let mount_files = self.app_mount_files.lock().await.get(app_id).cloned();
         Ok(mount_files)
     }
+
+    /// Extend runtime measurement for permission operations
+    /// This should be called for security-critical operations like whitelist management
+    pub async fn extend_permission_measurement(
+        &self,
+        operation_name: &str,
+        data: &str,
+    ) -> TappResult<()> {
+        self.aa
+            .lock()
+            .await
+            .extend_runtime_measurement(ZGEL_DOMAIN, operation_name, data, None)
+            .await?;
+
+        info!(
+            operation = %operation_name,
+            data = %data,
+            "Permission operation measurement extended"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -457,7 +476,6 @@ volumes:
             .to_string(),
             app_id: "test-nginx-app".to_string(),
             mount_files: vec![],
-            deployer: vec![0; 32],
         }
     }
 
@@ -475,7 +493,6 @@ volumes:
             .to_string(),
             app_id: "test-hello-app".to_string(),
             mount_files: vec![],
-            deployer: vec![0; 32],
         }
     }
 
@@ -506,7 +523,6 @@ services:
                     mode: "0644".to_string(),
                 },
             ],
-            deployer: vec![0; 32],
         }
     }
 
@@ -545,7 +561,8 @@ services:
         };
         let service = Arc::new(BootService::new(&config).await.unwrap());
         let request = create_real_request();
-        let response = service.start_app(request).await.unwrap();
+        let deployer = "0x0000000000000000000000000000000000000000".to_string();
+        let response = service.start_app(request, deployer).await.unwrap();
         assert!(response.success);
     }
 
@@ -557,7 +574,8 @@ services:
         };
         let service = Arc::new(BootService::new(&config).await.unwrap());
         let request = create_request_with_mount_files();
-        let response = service.start_app(request).await.unwrap();
+        let deployer = "0x0000000000000000000000000000000000000000".to_string();
+        let response = service.start_app(request, deployer).await.unwrap();
         assert!(response.success);
     }
 
@@ -569,9 +587,10 @@ services:
         };
         let service = Arc::new(BootService::new(&config).await.unwrap());
 
+        let deployer = "0x0000000000000000000000000000000000000000".to_string();
         service
             .clone()
-            .start_app(create_request_with_mount_files())
+            .start_app(create_request_with_mount_files(), deployer)
             .await
             .unwrap();
 

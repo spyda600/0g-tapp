@@ -1,8 +1,9 @@
 use clap::Parser;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tapp_service::{
-    auth_layer::ApiKeyLayer, config::TappConfig, init_tracing, TappServiceImpl, TappServiceServer,
-    VERSION,
+    auth_layer::AuthLayer, config::TappConfig, init_tracing, permission::PermissionManager,
+    TappServiceImpl, TappServiceServer, VERSION,
 };
 use tonic::transport::Server;
 use tower::ServiceBuilder;
@@ -72,8 +73,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Binding to address: {}", addr);
 
-    // Step 5: Initialize service
-    let service = match TappServiceImpl::new(config.clone()).await {
+    // Step 5: Initialize PermissionManager if configured
+    let permission_manager = if let Some(ref perm_config) = config.server.permission {
+        if perm_config.enabled {
+            info!("🔐 Permission-based authentication enabled");
+            info!("   Tapp owner: {}", perm_config.owner_address);
+
+            let pm = Arc::new(PermissionManager::new(perm_config.owner_address.clone()));
+
+            // Initialize whitelist with addresses from config
+            if !perm_config.initial_whitelist.is_empty() {
+                info!(
+                    "   Initializing whitelist with {} address(es)",
+                    perm_config.initial_whitelist.len()
+                );
+                for addr in &perm_config.initial_whitelist {
+                    pm.add_to_whitelist(addr.clone()).await.ok();
+                    info!("      - {}", addr);
+                }
+            }
+
+            Some(pm)
+        } else {
+            info!("🔓 Permission-based authentication disabled");
+            None
+        }
+    } else {
+        info!("🔓 Permission-based authentication not configured");
+        None
+    };
+
+    // Step 6: Initialize service with PermissionManager
+    let service = match TappServiceImpl::new(config.clone(), permission_manager.clone()).await {
         Ok(service) => {
             info!("✓ TAPP service initialized successfully");
             service
@@ -84,44 +115,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Step 6: Create API key layer and log configuration
-    let api_key_config = config.server.api_key.clone();
-
-    // Log API key configuration status
-    if let Some(ref api_config) = api_key_config {
-        if api_config.enabled {
-            info!(
-                "🔐 API key authentication enabled with {} key(s)",
-                api_config.keys.len()
-            );
-            if api_config.protected_methods.is_empty() {
-                info!("   All methods require API key authentication");
-            } else {
-                info!(
-                    "   Protected methods: {}",
-                    api_config.protected_methods.join(", ")
-                );
-            }
-        } else {
-            info!("🔓 API key authentication disabled");
-        }
+    // Step 7: Create gRPC server with auth layer
+    let auth_layer = if let Some(pm) = permission_manager {
+        AuthLayer::with_permission_manager(pm)
     } else {
-        info!("🔓 API key authentication not configured");
-    }
+        AuthLayer::new(config.server.permission.clone())
+    };
 
-    // Step 7: Create gRPC server with API key layer
-    // The layer automatically validates API keys based on configuration
-    // No need to modify individual RPC methods!
-    let layer = ServiceBuilder::new()
-        .layer(ApiKeyLayer::new(api_key_config))
-        .into_inner();
+    let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
     let server = Server::builder()
         .layer(layer)
         .add_service(TappServiceServer::new(service))
         .serve(addr);
 
-    info!("🌐 TAPP gRPC server starting on {}", addr);
+    info!("🌐 TAPP gRPC server listening on {}", addr);
 
     // Step 8: Handle shutdown gracefully
     tokio::select! {
