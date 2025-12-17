@@ -30,10 +30,29 @@ impl Default for HashAlgorithm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppMeasurement {
     pub app_id: String,
+    pub operation: String,     // "start_app", "stop_app", etc.
+    pub result: String,        // "success" or "failed"
+    pub error: Option<String>, // Error message if failed
     pub compose_hash: String,
     pub volumes_hash: String,
     pub deployer: String,
     pub timestamp: i64,
+}
+
+impl AppMeasurement {
+    /// Mark this measurement as successful
+    pub fn with_success(mut self) -> Self {
+        self.result = "success".to_string();
+        self.error = None;
+        self
+    }
+
+    /// Mark this measurement as failed with error message
+    pub fn with_failure(mut self, error: String) -> Self {
+        self.result = "failed".to_string();
+        self.error = Some(error);
+        self
+    }
 }
 
 /// Docker Compose measurement calculator

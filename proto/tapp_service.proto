@@ -146,11 +146,14 @@ message ListAppMeasurementsRequest {
 }
 
 message AppMeasurementInfo {
-  string app_id = 1;        // Application identifier (original, without suffix)
-  string compose_hash = 2;  // Hash of compose file content
-  string volumes_hash = 3;  // Hash of mounted volumes
-  string deployer = 4;      // Deployer public key (hex)
-  int64 timestamp = 5;      // Measurement timestamp
+  string app_id = 1;     // Application identifier (original, without suffix)
+  string operation = 2;  // "start_app", "stop_app", etc.
+  string result = 3;     // "success" or "failed"
+  optional string error = 4;  // Error message if failed
+  string compose_hash = 5;    // Hash of compose file content
+  string volumes_hash = 6;    // Hash of mounted volumes
+  string deployer = 7;        // Deployer public key (hex)
+  int64 timestamp = 8;        // Measurement timestamp
 }
 
 message ListAppMeasurementsResponse {

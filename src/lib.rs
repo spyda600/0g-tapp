@@ -3,10 +3,12 @@ pub mod auth_layer;
 pub mod boot;
 pub mod config;
 pub mod error;
+pub mod measurement_service;
 pub mod nonce_manager;
 pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
+pub mod task_manager;
 pub mod utils;
 pub use boot::BootService;
 pub use config::TappConfig;
@@ -38,6 +40,7 @@ pub struct TappServiceImpl {
     pub nonce_manager: nonce_manager::NonceManager,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
+    pub measurement_service: Arc<measurement_service::MeasurementService>,
 }
 
 impl TappServiceImpl {
@@ -86,9 +89,17 @@ impl TappServiceImpl {
     pub async fn new(
         config: TappConfig,
         permission_manager: Option<Arc<permission::PermissionManager>>,
+        measurement_service: Arc<measurement_service::MeasurementService>,
     ) -> TappResult<Self> {
         info!("Initializing TAPP service components");
-        let boot_service = Arc::new(BootService::new(&config.boot).await?);
+
+        // Initialize TaskManager
+        let task_manager = Arc::new(task_manager::TaskManager::new());
+
+        // Initialize BootService with measurement_service and task_manager
+        let boot_service = Arc::new(
+            BootService::new(&config.boot, measurement_service.clone(), task_manager).await?,
+        );
 
         // Initialize AppKeyService
         let app_key_service = if let Some(ref kbs) = config.kbs {
@@ -114,6 +125,7 @@ impl TappServiceImpl {
             nonce_manager,
             logs_service,
             permission_manager,
+            measurement_service,
             config,
         })
     }
@@ -272,6 +284,9 @@ impl TappService for TappServiceImpl {
             .iter()
             .map(|m| AppMeasurementInfo {
                 app_id: m.app_id.clone(),
+                operation: m.operation.clone(),
+                result: m.result.clone(),
+                error: m.error.clone(),
                 compose_hash: m.compose_hash.clone(),
                 volumes_hash: m.volumes_hash.clone(),
                 deployer: m.deployer.clone(),
@@ -559,14 +574,17 @@ impl TappService for TappServiceImpl {
 
         // Extend runtime measurement for this security-critical operation
         let measurement_data = serde_json::json!({
-            "operation": "add_to_whitelist",
+            "operation": measurement_service::OPERATION_NAME_ADD_TO_WHITELIST,
             "address": req.evm_address,
             "timestamp": utils::current_timestamp()
         })
         .to_string();
 
-        self.boot_service
-            .extend_permission_measurement(boot::OPERATION_NAME_ADD_TO_WHITELIST, &measurement_data)
+        self.measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_ADD_TO_WHITELIST,
+                &measurement_data,
+            )
             .await
             .map_err(|e| Status::internal(format!("Failed to extend measurement: {}", e)))?;
 
@@ -600,15 +618,15 @@ impl TappService for TappServiceImpl {
 
         // Extend runtime measurement for this security-critical operation
         let measurement_data = serde_json::json!({
-            "operation": "remove_from_whitelist",
+            "operation": measurement_service::OPERATION_NAME_REMOVE_FROM_WHITELIST,
             "address": req.evm_address,
             "timestamp": utils::current_timestamp()
         })
         .to_string();
 
-        self.boot_service
-            .extend_permission_measurement(
-                boot::OPERATION_NAME_REMOVE_FROM_WHITELIST,
+        self.measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_REMOVE_FROM_WHITELIST,
                 &measurement_data,
             )
             .await

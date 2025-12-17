@@ -1,3 +1,4 @@
+use attestation_agent::AttestationAgent;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -103,8 +104,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Step 6: Initialize service with PermissionManager
-    let service = match TappServiceImpl::new(config.clone(), permission_manager.clone()).await {
+    // Step 6: Initialize AttestationAgent and MeasurementService
+    let mut aa = AttestationAgent::new(config.boot.aa_config_path.as_deref())
+        .expect("Failed to create AttestationAgent");
+    aa.init()
+        .await
+        .expect("Failed to initialize AttestationAgent");
+
+    let measurement_service = Arc::new(tapp_service::measurement_service::MeasurementService::new(
+        Arc::new(tokio::sync::Mutex::new(aa)),
+    ));
+    info!(
+        "✓ Detected TEE type: {:?}",
+        measurement_service.get_tee_type().await
+    );
+
+    // Step 7: Initialize service with PermissionManager and MeasurementService
+    let service = match TappServiceImpl::new(
+        config.clone(),
+        permission_manager.clone(),
+        measurement_service,
+    )
+    .await
+    {
         Ok(service) => {
             info!("✓ TAPP service initialized successfully");
             service
@@ -115,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Step 7: Create gRPC server with auth layer
+    // Step 8: Create gRPC server with auth layer
     let auth_layer = if let Some(pm) = permission_manager {
         AuthLayer::with_permission_manager(pm)
     } else {

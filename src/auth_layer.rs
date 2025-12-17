@@ -217,15 +217,12 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         }
 
         // Owner or whitelist methods
-        "StartApp" => MethodPermission::OwnerOrWhitelist,
+        "StartApp" | "GetServiceLogs" => MethodPermission::OwnerOrWhitelist,
 
         // Owner or app owner (ownership checked in business layer)
         "StopApp" | "GetAppSecretKey" | "GetAppLogs" | "GetAppOwnership" => {
             MethodPermission::OwnerOrAppOwner
         }
-
-        // Service logs - owner only
-        "GetServiceLogs" => MethodPermission::OwnerOnly,
 
         // Default: require owner permission
         _ => {

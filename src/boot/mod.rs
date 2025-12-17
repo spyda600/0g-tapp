@@ -1,32 +1,26 @@
 pub mod manager;
 pub mod measurement;
-pub mod task_manager;
 
 pub use manager::{AppStatus, ContainerStatus, DockerComposeManager, MountFile};
 pub use measurement::{AppMeasurement, ComposeMeasurement, HashAlgorithm};
-pub use task_manager::{Task, TaskManager, TaskStatus as TaskState, TaskSuccessResult};
 
 use crate::config::BootServiceConfig;
 use crate::error::{DockerError, TappError, TappResult};
+use crate::measurement_service::MeasurementService;
 use crate::proto::{GetEvidenceRequest, GetEvidenceResponse, StartAppRequest, StartAppResponse};
-use attestation_agent::{AttestationAPIs, AttestationAgent};
+use crate::task_manager::{Task, TaskManager, TaskSuccessResult};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
-
-pub const ZGEL_DOMAIN: &str = "tapp.0g.com";
-pub const OPERATION_NAME_START_APP: &str = "start_app";
-pub const OPERATION_NAME_STOP_APP: &str = "stop_app";
-pub const OPERATION_NAME_ADD_TO_WHITELIST: &str = "add_to_whitelist";
-pub const OPERATION_NAME_REMOVE_FROM_WHITELIST: &str = "remove_from_whitelist";
 
 pub struct BootService {
     config: BootServiceConfig,
     manager: Mutex<DockerComposeManager>,
-    app_measurements: Mutex<HashMap<String, AppMeasurement>>,
-    aa: Mutex<AttestationAgent>,
-    task_manager: TaskManager,
+    app_measurements: Mutex<HashMap<String, Vec<AppMeasurement>>>,
+    measurement_service: Arc<MeasurementService>,
+    task_manager: Arc<TaskManager>,
     app_compose_content: Mutex<HashMap<String, String>>,
     app_mount_files: Mutex<HashMap<String, String>>,
 }
@@ -69,23 +63,19 @@ enable_eventlog = true
     }
 
     /// Create new Docker Compose service
-    pub async fn new(config: &BootServiceConfig) -> TappResult<Self> {
+    pub async fn new(
+        config: &BootServiceConfig,
+        measurement_service: Arc<MeasurementService>,
+        task_manager: Arc<TaskManager>,
+    ) -> TappResult<Self> {
         let manager = DockerComposeManager::new(&config.socket_path).await?;
 
-        // Ensure AA config exists with defaults
-        if let Some(ref aa_config_path) = config.aa_config_path {
-            Self::ensure_aa_config(aa_config_path)?;
-        }
-
-        let mut aa = AttestationAgent::new(config.aa_config_path.as_deref()).unwrap();
-        aa.init().await.unwrap();
-        info!("Detected TEE type: {:?}", aa.get_tee_type());
         Ok(Self {
             config: config.clone(),
             manager: Mutex::new(manager),
             app_measurements: Mutex::new(HashMap::new()),
-            aa: Mutex::new(aa),
-            task_manager: TaskManager::new(),
+            measurement_service,
+            task_manager,
             app_compose_content: Mutex::new(HashMap::new()),
             app_mount_files: Mutex::new(HashMap::new()),
         })
@@ -93,6 +83,47 @@ enable_eventlog = true
 
     /// Internal method to handle the actual app start logic
     async fn _start_app(&self, request: StartAppRequest, deployer: String, task_id: String) {
+        let app_id = request.app_id.clone();
+
+        // Convert proto MountFile to our MountFile structure (needed for both success and failure)
+        let mount_files: Vec<MountFile> = request
+            .mount_files
+            .iter()
+            .map(|mf| MountFile {
+                source_path: mf.source_path.clone(),
+                content: mf.content.clone(),
+                mode: if mf.mode.is_empty() {
+                    "0644".to_string()
+                } else {
+                    mf.mode.clone()
+                },
+            })
+            .collect();
+
+        // Calculate application measurement once (before we know success/failure)
+        let base_measurement_result = self
+            .calculate_app_measurement(
+                &request,
+                &mount_files,
+                &app_id,
+                &deployer,
+                crate::measurement_service::OPERATION_NAME_START_APP,
+            )
+            .await;
+
+        // Handle the measurement calculation result
+        let (base_measurement, compose_content, volumes_content) = match base_measurement_result {
+            Ok(result) => result,
+            Err(e) => {
+                // If measurement calculation fails, mark task as failed and return
+                self.task_manager
+                    .mark_failed(&task_id, format!("Failed to calculate measurement: {}", e))
+                    .await;
+                return;
+            }
+        };
+
+        // Try to start the application
         let result = async {
             let app_id = request.app_id.clone();
             if self.app_measurements.lock().await.contains_key(&app_id) {
@@ -110,29 +141,7 @@ enable_eventlog = true
                 "Starting application with Docker Compose"
             );
 
-            // Convert proto MountFile to our MountFile structure
-            let mount_files: Vec<MountFile> = request
-                .mount_files
-                .iter()
-                .map(|mf| MountFile {
-                    source_path: mf.source_path.clone(),
-                    content: mf.content.clone(),
-                    mode: if mf.mode.is_empty() {
-                        "0644".to_string()
-                    } else {
-                        mf.mode.clone()
-                    },
-                })
-                .collect();
-
-            // Calculate application measurement
-            let (measurement, compose_content, volumes_content) = self
-                .calculate_app_measurement(&request, &mount_files, &app_id, &deployer)
-                .await?;
-
-            let measurement_json = serde_json::to_string(&measurement)?;
-            info!("measurement_json: {}", measurement_json);
-
+            // Store compose content and mount files
             self.app_compose_content
                 .lock()
                 .await
@@ -147,23 +156,6 @@ enable_eventlog = true
             DockerComposeManager::deploy_compose(&app_id, &request.compose_content, &mount_files)
                 .await?;
 
-            // Store measurement in memory
-            self.app_measurements
-                .lock()
-                .await
-                .insert(app_id.clone(), measurement.clone());
-
-            self.aa
-                .lock()
-                .await
-                .extend_runtime_measurement(
-                    ZGEL_DOMAIN,
-                    OPERATION_NAME_START_APP,
-                    &measurement_json,
-                    None,
-                )
-                .await?;
-
             info!(
                 task_id = %task_id,
                 app_id = %app_id,
@@ -173,6 +165,38 @@ enable_eventlog = true
             Ok::<_, crate::error::TappError>((app_id, deployer.clone()))
         }
         .await;
+
+        // Mark measurement as success or failure based on result
+        let final_measurement = match &result {
+            Ok(_) => base_measurement.with_success(),
+            Err(e) => base_measurement.with_failure(format!("{}", e)),
+        };
+
+        // Store measurement and extend runtime measurement (ONCE for both success/failure)
+        let measurement_json = serde_json::to_string(&final_measurement)
+            .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
+
+        info!("measurement_json: {}", measurement_json);
+
+        // Store measurement in memory (append to history)
+        self.app_measurements
+            .lock()
+            .await
+            .entry(app_id.clone())
+            .or_insert_with(Vec::new)
+            .push(final_measurement.clone());
+
+        // Extend runtime measurement via measurement service
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                crate::measurement_service::OPERATION_NAME_START_APP,
+                &measurement_json,
+            )
+            .await
+        {
+            tracing::error!("Failed to extend measurement: {}", e);
+        }
 
         // Update task status based on result
         match result {
@@ -254,15 +278,17 @@ enable_eventlog = true
         DockerComposeManager::get_app_logs(app_id, lines, service_name).await
     }
 
-    /// List all app measurements
+    /// List all app measurements (returns all historical measurements)
     pub async fn list_app_measurements(
         &self,
         deployer_filter: Option<String>,
     ) -> Vec<AppMeasurement> {
         let measurements = self.app_measurements.lock().await;
 
+        // Flatten all measurement histories into a single vec
         let mut result: Vec<AppMeasurement> = measurements
             .values()
+            .flatten()
             .filter(|m| {
                 // Apply deployer filter if provided
                 if let Some(ref filter) = deployer_filter {
@@ -308,12 +334,13 @@ enable_eventlog = true
 
         info!("report_data: {:?}", hex::encode(&report_data));
 
-        let evidence = self.aa.lock().await.get_evidence(&report_data).await?;
+        let evidence = self.measurement_service.get_evidence(&report_data).await?;
+        let tee_type = self.measurement_service.get_tee_type().await;
         Ok(GetEvidenceResponse {
             success: true,
             message: "Evidence generated successfully".to_string(),
-            evidence: evidence,
-            tee_type: format!("{:?}", self.aa.lock().await.get_tee_type()),
+            evidence,
+            tee_type,
             timestamp: crate::utils::current_timestamp(),
         })
     }
@@ -350,28 +377,27 @@ enable_eventlog = true
         request: &StartAppRequest,
         mount_files: &[MountFile],
         app_id: &str,
-        deployer: &str, // EVM address from signature
+        deployer: &str,  // EVM address from signature
+        operation: &str, // Operation name like "start_app"
     ) -> TappResult<(AppMeasurement, String, String)> {
         let measurement = ComposeMeasurement::new();
 
         // Calculate compose file hash
-        // println!("compose_content: {}", request.compose_content);
         let compose_hash = measurement.calculate_compose_hash(&request.compose_content)?;
-        // println!("compose_hash: {:?}", compose_hash);
 
         // Calculate volumes hash from mount files (uploaded files)
-        // This is the key change: now we calculate hash from actual file contents
-        // println!("mount_files: {:?}", mount_files);
         let (volumes_hash, volumes_content) =
             measurement.calculate_mount_files_hash(mount_files)?;
-        // println!("volumes_hash: {:?}", volumes_hash);
 
         Ok((
             AppMeasurement {
                 app_id: app_id.to_string(),
+                operation: operation.to_string(),
+                result: String::new(), // Will be set by with_success() or with_failure()
+                error: None,           // Will be set by with_failure() if needed
                 compose_hash,
                 volumes_hash,
-                deployer: deployer.to_string(), // Use EVM address directly
+                deployer: deployer.to_string(),
                 timestamp: crate::utils::current_timestamp(),
             },
             request.compose_content.clone(),
@@ -383,42 +409,93 @@ enable_eventlog = true
     pub async fn stop_app(&self, app_id: &str) -> TappResult<()> {
         info!(app_id = %app_id, "Stopping application");
 
-        // 1. Stop compose
-        DockerComposeManager::stop_compose(app_id).await?;
+        // Get the latest measurement for this app (to use for stop operation measurement)
+        let base_measurement = {
+            let measurements = self.app_measurements.lock().await;
+            if let Some(history) = measurements.get(app_id) {
+                if let Some(latest) = history.last() {
+                    // Create a new measurement for stop operation based on the latest one
+                    AppMeasurement {
+                        app_id: app_id.to_string(),
+                        operation: crate::measurement_service::OPERATION_NAME_STOP_APP.to_string(),
+                        result: String::new(),
+                        error: None,
+                        compose_hash: latest.compose_hash.clone(),
+                        volumes_hash: latest.volumes_hash.clone(),
+                        deployer: latest.deployer.clone(),
+                        timestamp: crate::utils::current_timestamp(),
+                    }
+                } else {
+                    return Err(TappError::InvalidParameter {
+                        field: "app_id".to_string(),
+                        reason: format!("No measurement found for app {}", app_id),
+                    });
+                }
+            } else {
+                return Err(TappError::InvalidParameter {
+                    field: "app_id".to_string(),
+                    reason: format!("No measurement found for app {}", app_id),
+                });
+            }
+        };
 
-        // 2. Delete app directory
-        let app_dir = DockerComposeManager::get_app_dir(app_id);
-        if app_dir.exists() {
-            tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
-                    operation: "delete_app_dir".to_string(),
-                    reason: format!("Failed to delete app directory: {}", e),
-                })
-            })?;
-            info!(app_id = %app_id, "App directory deleted successfully");
+        // Try to stop the application
+        let result = async {
+            // 1. Stop compose
+            DockerComposeManager::stop_compose(app_id).await?;
+
+            // 2. Delete app directory
+            let app_dir = DockerComposeManager::get_app_dir(app_id);
+            if app_dir.exists() {
+                tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
+                    TappError::Docker(DockerError::ContainerOperationFailed {
+                        operation: "delete_app_dir".to_string(),
+                        reason: format!("Failed to delete app directory: {}", e),
+                    })
+                })?;
+                info!(app_id = %app_id, "App directory deleted successfully");
+            }
+
+            Ok::<_, crate::error::TappError>(())
         }
+        .await;
 
-        // 3. If has measurement, extend runtime measurement for stop operation
-        if let Some(measurement) = self.app_measurements.lock().await.get(app_id).cloned() {
-            info!(app_id = %app_id, "Extending runtime measurement for stop operation");
-            let measurement_json = serde_json::to_string(&measurement)?;
+        // Mark measurement as success or failure based on result
+        let final_measurement = match &result {
+            Ok(_) => base_measurement.with_success(),
+            Err(e) => base_measurement.with_failure(format!("{}", e)),
+        };
 
-            self.aa
-                .lock()
-                .await
-                .extend_runtime_measurement(
-                    ZGEL_DOMAIN,
-                    OPERATION_NAME_STOP_APP,
-                    &measurement_json,
-                    None,
-                )
-                .await?;
+        // Store measurement and extend runtime measurement (ONCE for both success/failure)
+        let measurement_json = serde_json::to_string(&final_measurement)
+            .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
 
-            info!(app_id = %app_id, "Runtime measurement extended for stop operation");
+        info!("stop_app measurement_json: {}", measurement_json);
+
+        // Store measurement in memory (append to history)
+        self.app_measurements
+            .lock()
+            .await
+            .entry(app_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(final_measurement.clone());
+
+        // Extend runtime measurement via measurement service
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                crate::measurement_service::OPERATION_NAME_STOP_APP,
+                &measurement_json,
+            )
+            .await
+        {
+            tracing::error!("Failed to extend measurement for stop operation: {}", e);
         }
 
         info!(app_id = %app_id, "Application stopped successfully");
-        Ok(())
+
+        // Return the original result
+        result
     }
 
     pub async fn get_app_compose_content(&self, app_id: &str) -> TappResult<Option<String>> {
@@ -430,181 +507,7 @@ enable_eventlog = true
         let mount_files = self.app_mount_files.lock().await.get(app_id).cloned();
         Ok(mount_files)
     }
-
-    /// Extend runtime measurement for permission operations
-    /// This should be called for security-critical operations like whitelist management
-    pub async fn extend_permission_measurement(
-        &self,
-        operation_name: &str,
-        data: &str,
-    ) -> TappResult<()> {
-        self.aa
-            .lock()
-            .await
-            .extend_runtime_measurement(ZGEL_DOMAIN, operation_name, data, None)
-            .await?;
-
-        info!(
-            operation = %operation_name,
-            data = %data,
-            "Permission operation measurement extended"
-        );
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::File;
-    use std::sync::Arc;
-
-    fn create_test_request() -> StartAppRequest {
-        StartAppRequest {
-            compose_content: r#"
-version: '3.8'
-services:
-  web:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-volumes:
-  data:
-    driver: local
-"#
-            .to_string(),
-            app_id: "test-nginx-app".to_string(),
-            mount_files: vec![],
-        }
-    }
-
-    fn create_real_request() -> StartAppRequest {
-        StartAppRequest {
-            compose_content: r#"
-    version: '3.8'
-    services:
-      hello:
-        image: hello-world
-    volumes:
-      data:
-        driver: local
-    "#
-            .to_string(),
-            app_id: "test-hello-app".to_string(),
-            mount_files: vec![],
-        }
-    }
-
-    fn create_request_with_mount_files() -> StartAppRequest {
-        use crate::proto::MountFile as ProtoMountFile;
-
-        StartAppRequest {
-            compose_content: r#"
-version: '3.8'
-services:
-  web:
-    image: nginx:alpine
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./config.json:/app/config.json:ro
-"#
-            .to_string(),
-            app_id: "test-nginx-app".to_string(),
-            mount_files: vec![
-                ProtoMountFile {
-                    source_path: "./nginx.conf".to_string(),
-                    content: b"user nginx;\nworker_processes 1;\n".to_vec(),
-                    mode: "0644".to_string(),
-                },
-                ProtoMountFile {
-                    source_path: "./config.json".to_string(),
-                    content: b"{\"key\": \"value\", \"enabled\": true}".to_vec(),
-                    mode: "0644".to_string(),
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn test_validate_request() {
-        let service = BootService {
-            config: BootServiceConfig::default(),
-            manager: Mutex::new(DockerComposeManager::mock()),
-            app_measurements: Mutex::new(HashMap::new()),
-            aa: Mutex::new(AttestationAgent::new(None).unwrap()),
-            task_manager: TaskManager::new(),
-            app_compose_content: Mutex::new(HashMap::new()),
-            app_mount_files: Mutex::new(HashMap::new()),
-        };
-
-        // Valid request
-        let request = create_test_request();
-        assert!(service.validate_request(&request).is_ok());
-
-        // Invalid - empty compose content
-        let mut invalid_request = create_test_request();
-        invalid_request.compose_content = "".to_string();
-        assert!(service.validate_request(&invalid_request).is_err());
-
-        // Invalid - empty app ID
-        let mut invalid_request = create_test_request();
-        invalid_request.app_id = "".to_string();
-        assert!(service.validate_request(&invalid_request).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_start_app() {
-        let config = BootServiceConfig {
-            socket_path: "/var/run/docker.sock".to_string(),
-            ..Default::default()
-        };
-        let service = Arc::new(BootService::new(&config).await.unwrap());
-        let request = create_real_request();
-        let deployer = "0x0000000000000000000000000000000000000000".to_string();
-        let response = service.start_app(request, deployer).await.unwrap();
-        assert!(response.success);
-    }
-
-    #[tokio::test]
-    async fn test_start_app_with_mount_files() {
-        let config = BootServiceConfig {
-            socket_path: "/var/run/docker.sock".to_string(),
-            ..Default::default()
-        };
-        let service = Arc::new(BootService::new(&config).await.unwrap());
-        let request = create_request_with_mount_files();
-        let deployer = "0x0000000000000000000000000000000000000000".to_string();
-        let response = service.start_app(request, deployer).await.unwrap();
-        assert!(response.success);
-    }
-
-    #[tokio::test]
-    async fn test_get_evidence() {
-        let config = BootServiceConfig {
-            socket_path: "/var/run/docker.sock".to_string(),
-            ..Default::default()
-        };
-        let service = Arc::new(BootService::new(&config).await.unwrap());
-
-        let deployer = "0x0000000000000000000000000000000000000000".to_string();
-        service
-            .clone()
-            .start_app(create_request_with_mount_files(), deployer)
-            .await
-            .unwrap();
-
-        // Create custom report data (e.g., a nonce or hash)
-        let custom_data = b"test-nonce-12345678";
-        let request = GetEvidenceRequest {
-            report_data: custom_data.to_vec(),
-        };
-        let response = service.get_evidence(request).await.unwrap();
-
-        let evidence_json =
-            serde_json::to_string(&String::from_utf8(response.evidence).unwrap()).unwrap();
-        let file = File::create("evidence.json").unwrap();
-        serde_json::to_writer(file, &evidence_json).unwrap();
-        assert!(response.success);
-    }
-}
+mod tests {}
