@@ -293,7 +293,7 @@ impl TappService for TappServiceImpl {
                 app_id: m.app_id.clone(),
                 operation: m.operation.clone(),
                 result: m.result.clone(),
-                error: m.error.clone(),
+                error: m.error.clone().unwrap_or_default(),
                 compose_hash: m.compose_hash.clone(),
                 volumes_hash: m.volumes_hash.clone(),
                 deployer: m.deployer.clone(),
