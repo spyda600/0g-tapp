@@ -9,7 +9,7 @@
 - **Remote Attestation**: Generate and verify attestation evidence
 - **Docker Compose Integration**: Deploy containerized applications easily
 - **gRPC API**: Comprehensive API for application lifecycle management
-- **API Key Authentication**: Secure access control for sensitive operations
+- **Signature-based Authentication**: EVM-compatible signature verification for access control
 
 ## Getting Started
 
@@ -58,93 +58,55 @@ Once the instance is created and running, 0G Tapp service will start automatical
 Use the provided example script to deploy an application:
 
 ```bash
-# Basic usage (connects to your-cvm-instance-host:port)
-./examples/start_app.sh
+./start_app.sh --host HOST --port PORT --app-id APP_ID [OPTIONS]
 
-# Custom host and port
-./examples/start_app.sh <HOST> <PORT> <APP_ID> <DEPLOYER_HEX> <COMPOSE_FILE> <CONFIG_FILE> <API_KEY> 
+# Example with owner credentials
+export TAPP_OWNER_PRIVATE_KEY="0x..."
+./start_app.sh --host your-cvm-instance-host --port 50051 --app-id my-nginx-app --use-owner
 
-# Example
-./examples/start_app.sh your-cvm-instance-host port your-app-id 0xbae50462... ./docker_compose.yml ./config.yml your-api-key
+# Example with custom private key
+./start_app.sh --host localhost --port 50051 --app-id my-app --private-key 0xabcd1234...
 ```
 
-The script will:
-1. Submit a StartApp request with Docker Compose configuration
-2. Return a task ID for tracking deployment progress
-3. The application will be measured and extended to TEE runtime measurements
-4. For actual deployment, please modify Docker Compose and its configuration
-5. RootFS space is limited, please store data in the /data directory
+**Options:**
+- `--host HOST`: gRPC server host (default: localhost)
+- `--port PORT`: gRPC server port (default: 50051)
+- `--app-id APP_ID`: Application ID (default: test-broker-app)
+- `--private-key KEY`: Private key for signing (required unless using presets)
+- `--compose-file FILE`: Docker compose file (default: examples/docker-compose.yml)
+- `--use-owner`: Use pre-configured owner credentials (requires TAPP_OWNER_PRIVATE_KEY env var)
+- `--use-whitelist`: Use pre-configured whitelist user credentials (requires TAPP_WHITELIST_PRIVATE_KEY env var)
 
-#### Checking Task Status
+**What happens:**
+1. The script submits a StartApp request with Docker Compose configuration
+2. Files referenced in volume mounts (e.g., `./config.yml:/app/config.yml`) are automatically uploaded
+3. Returns a task ID for tracking deployment progress
+4. The application deployment is cryptographically measured and extended to TEE runtime measurements
 
-Monitor the deployment progress:
-
-```bash
-./examples/get_task_status.sh <TASK_ID> [HOST] [PORT]
-```
+**Note:** RootFS space is limited, store data in the `/data` directory.
 
 #### Stopping an Application
 
 Stop and remove a deployed application:
 
 ```bash
-# Basic usage
-./examples/stop_app.sh <APP_ID>
+./stop_app.sh --host HOST --port PORT --app-id APP_ID [OPTIONS]
 
-# Custom host and API key
-./examples/stop_app.sh <APP_ID> <HOST> <PORT> <API_KEY>
+# Example with owner credentials
+export TAPP_OWNER_PRIVATE_KEY="0x..."
+./stop_app.sh --host your-cvm-instance-host --port 50051 --app-id my-nginx-app --use-owner
 
-# Example
-./examples/stop_app.sh my-nginx-app your-cvm-instance-host port your-api-key
+# Example with custom private key
+./stop_app.sh --host localhost --port 50051 --app-id my-app --private-key 0xabcd1234...
 ```
 
-#### Getting Application Logs
-
-Retrieve logs from a running application:
-
-```bash
-./examples/get_app_log.sh <APP_ID> [LINES] [SERVICE_NAME] [HOST] [PORT]
-```
-
-#### Listing Deployed Applications
-
-View all deployed applications with their measurements:
-
-```bash
-./examples/list_app_measurements.sh [HOST] [PORT] [DEPLOYER_FILTER]
-```
-
-#### Getting Attestation Evidence
-
-Retrieve TEE attestation evidence for verification:
-
-```bash
-./examples/get_evidence.sh [HOST] [PORT] [REPORT_DATA_HEX]
-```
-
-## API Reference
-
-0G Tapp provides a gRPC API with the following key services:
-
-### Application Management
-- `StartApp`: Deploy a new application (async)
-- `StopApp`: Stop and remove an application
-- `GetAppInfo`: Get application configuration
-- `GetAppLogs`: Retrieve application logs
-- `ListAppMeasurements`: List all deployed applications with measurements
-
-### Task Management
-- `GetTaskStatus`: Check status of async operations
-
-### Attestation
-- `GetEvidence`: Generate TEE attestation evidence
-
-### Key Management
-- `GetAppKey`: Get application-bound public key
-- `GetAppSecretKey`: Retrieve application private key (local access only)
-
-### Service Monitoring
-- `GetServiceLogs`: Retrieve service logs
+**Options:**
+- `--host HOST`: gRPC server host (default: localhost)
+- `--port PORT`: gRPC server port (default: 50051)
+- `--app-id APP_ID`: Application ID to stop (required)
+- `--private-key KEY`: Private key for signing (required unless using presets)
+- `--use-owner`: Use pre-configured owner credentials
+- `--use-whitelist`: Use pre-configured whitelist user credentials
 
 ## Security
 
@@ -171,20 +133,59 @@ This security model is ideal for scenarios requiring maximum trust minimization,
 - Privacy-preserving data processing
 - Trustless application execution
 
-### API Key Authentication
-
-Protected methods require API key authentication via the `x-api-key` header:
-
-```bash
-# Set API key in environment
-export TAPP_API_KEY="your-secret-api-key"
-```
-
-Configure API keys in the service configuration file under `[server.api_key]` section.
-
 ### Trusted Execution Environment
 
 All applications run within TEE boundaries and are cryptographically measured. The runtime measurements are extended to the TEE event log for remote attestation.
+
+### Measurement Design Philosophy
+
+0G Tapp implements a carefully designed measurement strategy that balances security auditability with operational efficiency:
+
+#### What Gets Measured
+
+**✅ Operations that execute within the TEE:**
+- **Successful operations**: Application deployments, configuration changes, and lifecycle operations that complete successfully
+- **Failed operations**: Operations that were permitted but failed during execution (e.g., Docker deployment failures, resource constraints)
+
+All measurements include:
+- Operation type (start_app, stop_app, etc.)
+- Application configuration hashes (Docker Compose, mount files)
+- Deployer identity (EVM address)
+- Execution result (success/failed) and error details
+- Timestamp
+
+**❌ What is NOT measured:**
+
+- **Permission check failures**: Operations blocked by authentication or authorization layers
+- **Pre-execution validation failures**: Requests rejected before entering the TEE execution context
+
+#### Rationale
+
+The key principle is: **Measure what the TEE cannot judge, but must record for accountability.**
+
+**Why measure successful operations:**
+- Creates an immutable audit trail of all applications deployed in the TEE
+- Enables remote parties to verify exactly what code is running
+- Binds cryptographic identities to specific deployments
+
+**Why measure failed operations:**
+- Failed operations represent actual execution attempts that consumed TEE resources
+- Repeated failures may indicate attack probing or system misconfiguration
+- Provides complete forensic history for security analysis
+- Users should be accountable for what they attempted, not just what succeeded
+
+**Why NOT measure permission denials:**
+- These are policy enforcement actions that happen before TEE execution
+- TAPP can definitively determine authorization - no ambiguity exists
+- Recording every rejected request would create noise without security value
+- The TEE didn't execute anything, so there's nothing to audit from a runtime perspective
+
+**Example:**
+- ❌ User tries to deploy without proper authentication → **Rejected, not measured** (TAPP policy enforcement)
+- ✅ User deploys a Docker container that fails to start → **Measured as failure** (TEE executed, outcome uncertain)
+- ✅ User deploys a malicious container that runs successfully → **Measured as success** (TEE cannot judge intent, only record what happened)
+
+This design ensures that TEE measurements provide a complete, tamper-proof record of all operations that actually executed within the trusted environment, while avoiding unnecessary overhead from policy enforcement actions.
 
 ## Building from Source
 
@@ -209,10 +210,12 @@ Create a `config.toml` file:
 host = "0.0.0.0"
 port = 50051
 
-[server.api_key]
+[server.permission]
 enabled = true
-keys = ["your-secret-api-key-1", "your-secret-api-key-2"]
-protected_methods = ["StartApp", "StopApp"]
+owner_address = "0xea695C312CE119dE347425B29AFf85371c9d1837"
+initial_whitelist = [
+    "0x0E552ac14124F6f336a4504Aa72c921b4D7F8032"
+]
 
 [boot]
 socket_path = "/var/run/docker.sock"
@@ -221,20 +224,3 @@ socket_path = "/var/run/docker.sock"
 level = "info"
 path = "/var/log/tapp/"
 ```
-
-## Examples
-
-See the `examples/` directory for complete usage examples:
-- `start_app.sh` - Deploy an nginx application
-- `start_0g_provider.sh` - Deploy 0G Serving Provider
-- `stop_app.sh` - Stop an application
-- `get_evidence.sh` - Retrieve attestation evidence
-- `get_app_log.sh` - View application logs
-
-## License
-
-[License information]
-
-## Contributing
-
-[Contributing guidelines]
