@@ -15,7 +15,7 @@ pub use config::TappConfig;
 pub use error::{TappError, TappResult};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{error, info};
 
 // Re-export generated protobuf types
 pub mod proto {
@@ -199,6 +199,13 @@ impl TappService for TappServiceImpl {
             if let Some(signer_addr) = signer {
                 // Check if user can manage this app
                 if !pm.can_manage_app(&app_id, &signer_addr).await {
+                    error!(
+                        app_id = %app_id,
+                        requester = %signer_addr,
+                        event = "APP_STOP_AUTHORIZED",
+                        "You don't have permission to stop app {}. Only the app owner or tapp owner can stop it.",
+                        app_id
+                    );
                     return Err(Status::permission_denied(format!(
                         "You don't have permission to stop app {}. Only the app owner or tapp owner can stop it.",
                         app_id

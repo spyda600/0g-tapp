@@ -194,10 +194,9 @@ pub struct SignerAddress(pub String);
 /// Method permission requirements
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MethodPermission {
-    Public,           // No auth required
-    OwnerOnly,        // Only tapp owner
-    OwnerOrWhitelist, // Owner or whitelisted users
-    OwnerOrAppOwner,  // Owner or app owner (checked in business layer)
+    Public,    // No auth required
+    OwnerOnly, // Only tapp owner
+    Whitelist, // Owner or whitelisted users
 }
 
 /// Get permission requirement for a method
@@ -217,12 +216,8 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         }
 
         // Owner or whitelist methods
-        "StartApp" | "GetServiceLogs" => MethodPermission::OwnerOrWhitelist,
-
-        // Owner or app owner (ownership checked in business layer)
-        "StopApp" | "GetAppSecretKey" | "GetAppLogs" | "GetAppOwnership" => {
-            MethodPermission::OwnerOrAppOwner
-        }
+        "StartApp" | "GetServiceLogs" | "StopApp" | "GetAppSecretKey" | "GetAppLogs"
+        | "GetAppOwnership" => MethodPermission::Whitelist,
 
         // Default: require owner permission
         _ => {
@@ -237,12 +232,7 @@ fn is_authorized(required: &MethodPermission, actual: &Permission) -> bool {
     match required {
         MethodPermission::Public => true,
         MethodPermission::OwnerOnly => *actual == Permission::Owner,
-        MethodPermission::OwnerOrWhitelist => {
-            *actual == Permission::Owner || *actual == Permission::Whitelist
-        }
-        MethodPermission::OwnerOrAppOwner => {
-            // Allow owner and whitelist through
-            // Actual app ownership check happens in business layer
+        MethodPermission::Whitelist => {
             *actual == Permission::Owner || *actual == Permission::Whitelist
         }
     }

@@ -27,7 +27,7 @@ pub struct BootService {
 
 impl BootService {
     /// Ensure attestation agent config file exists with default values
-    fn ensure_aa_config(config_path: &str) -> TappResult<()> {
+    pub fn ensure_aa_config(config_path: &str) -> TappResult<()> {
         let path = Path::new(config_path);
 
         // If file already exists, do nothing
@@ -126,14 +126,6 @@ enable_eventlog = true
         // Try to start the application
         let result = async {
             let app_id = request.app_id.clone();
-            if self.app_measurements.lock().await.contains_key(&app_id) {
-                return Err(TappError::InvalidParameter {
-                    field: "app_id".to_string(),
-                    reason: format!("Application {} already exists", app_id),
-                }
-                .into());
-            }
-
             info!(
                 task_id = %task_id,
                 app_id = %app_id,

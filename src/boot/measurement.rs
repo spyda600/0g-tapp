@@ -30,9 +30,9 @@ impl Default for HashAlgorithm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppMeasurement {
     pub app_id: String,
-    pub operation: String,     // "start_app", "stop_app", etc.
-    pub result: String,        // "success" or "failed"
-    pub error: Option<String>, // Error message if failed
+    pub operation: String,
+    pub result: String,
+    pub error: Option<String>,
     pub compose_hash: String,
     pub volumes_hash: String,
     pub deployer: String,

@@ -105,6 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Step 6: Initialize AttestationAgent and MeasurementService
+    // Ensure AA config file exists
+    if let Some(ref aa_config_path) = config.boot.aa_config_path {
+        tapp_service::boot::BootService::ensure_aa_config(aa_config_path)
+            .expect("Failed to ensure AA config");
+    }
     let mut aa = AttestationAgent::new(config.boot.aa_config_path.as_deref())
         .expect("Failed to create AttestationAgent");
     aa.init()
