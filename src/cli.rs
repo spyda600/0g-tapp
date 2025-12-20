@@ -318,14 +318,8 @@ async fn get_app_secret_key(
     message.extend_from_slice(nonce.as_bytes());
     message.extend_from_slice(&timestamp.to_le_bytes());
 
-    // Sign the message with deployer's private key
-    let signature = tapp_service::app_key::sign_message(&deployer_private_key, &message)?;
-
     let request = Request::new(GetAppSecretKeyRequest {
         app_id: app_id.clone(),
-        nonce: nonce.clone(),
-        timestamp,
-        signature,
     });
 
     // Server will validate signature and that the connection is from localhost

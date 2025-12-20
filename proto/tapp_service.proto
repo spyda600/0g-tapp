@@ -203,11 +203,7 @@ message GetAppKeyResponse {
 
 // Get App Secret Key Messages (local access only)
 message GetAppSecretKeyRequest {
-  string app_id = 1;    // Application identifier
-  string nonce = 2;     // Random nonce (prevents replay attacks)
-  int64 timestamp = 3;  // Request timestamp (unix timestamp in seconds)
-  bytes signature = 4;  // Deployer's signature over (app_id || nonce ||
-                        // timestamp) Must be signed by the app's deployer
+  string app_id = 1;  // Application identifier
 }
 
 message GetAppSecretKeyResponse {
