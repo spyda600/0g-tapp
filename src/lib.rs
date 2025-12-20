@@ -336,10 +336,10 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppSecretKeyRequest>,
     ) -> Result<Response<GetAppSecretKeyResponse>, Status> {
-        // Extract remote address BEFORE consuming request
+        // SECURITY: Extract remote address BEFORE consuming request
         let remote_addr = request.remote_addr();
 
-        // Validate that the request is from localhost or Docker network
+        // SECURITY: Validate that the request is from localhost or Docker network
         let (is_allowed, source_type) = if let Some(addr) = remote_addr {
             let ip = addr.ip();
             let allowed = Self::is_allowed_local_access(ip);
@@ -351,7 +351,6 @@ impl TappService for TappServiceImpl {
         };
 
         if !is_allowed {
-            // SECURITY: Log rejected attempts with full details
             tracing::error!(
                 remote_addr = ?remote_addr,
                 event = "SECRET_KEY_ACCESS_DENIED",
@@ -364,39 +363,38 @@ impl TappService for TappServiceImpl {
             ));
         }
 
+        // Get signer address from signature (handled by AuthLayer)
+        let signer = auth_layer::get_signer_address(&request);
         let req = request.into_inner();
 
-        // SECURITY: Verify nonce and timestamp to prevent replay attacks
-        if let Err(e) = self
-            .nonce_manager
-            .verify_and_consume(&req.nonce, req.timestamp)
-            .await
-        {
-            tracing::error!(
-                app_id = %req.app_id,
-                remote_addr = ?remote_addr,
-                source_type = source_type,
-                event = "SECRET_KEY_ACCESS_DENIED",
-                reason = "nonce verification failed",
-                error = %e,
-                "Nonce verification failed"
-            );
+        // SECURITY: Check app ownership
+        if let Some(pm) = &self.permission_manager {
+            if let Some(signer_addr) = &signer {
+                if !pm.can_manage_app(&req.app_id, signer_addr).await {
+                    tracing::error!(
+                        app_id = %req.app_id,
+                        signer = %signer_addr,
+                        remote_addr = ?remote_addr,
+                        event = "SECRET_KEY_ACCESS_DENIED",
+                        reason = "not app owner or tapp owner",
+                        "Permission denied: only app owner or tapp owner can access secret key"
+                    );
 
-            return Err(Status::permission_denied(format!(
-                "Nonce verification failed: {}",
-                e
-            )));
+                    return Err(Status::permission_denied(
+                        "Only the app owner or tapp owner can access the app's secret key",
+                    ));
+                }
+            }
         }
 
-        // SECURITY: Get deployer public key from app measurements
-        let app_measurements = self.boot_service.list_app_measurements(None).await;
-        let app_measurement = app_measurements
-            .iter()
-            .find(|m| m.app_id == req.app_id)
+        // Get the app's latest measurement to get compose_hash, volumes_hash, deployer
+        let latest_measurement = self
+            .boot_service
+            .get_latest_app_measurement(&req.app_id)
+            .await
             .ok_or_else(|| {
                 tracing::error!(
                     app_id = %req.app_id,
-                    remote_addr = ?remote_addr,
                     event = "SECRET_KEY_ACCESS_DENIED",
                     reason = "app not found",
                     "App not found in measurements"
@@ -404,88 +402,100 @@ impl TappService for TappServiceImpl {
                 Status::not_found(format!("App {} not found", req.app_id))
             })?;
 
-        // Decode deployer public key from hex
-        let deployer_pubkey = hex::decode(&app_measurement.deployer).map_err(|e| {
-            tracing::error!(
-                app_id = %req.app_id,
-                error = %e,
-                "Failed to decode deployer public key"
-            );
-            Status::internal("Failed to decode deployer public key")
-        })?;
-
-        // SECURITY: Verify deployer signature
-        // Message format: app_id || nonce || timestamp (as bytes)
-        let mut message = Vec::new();
-        message.extend_from_slice(req.app_id.as_bytes());
-        message.extend_from_slice(req.nonce.as_bytes());
-        message.extend_from_slice(&req.timestamp.to_le_bytes());
-
-        let signature_valid = app_key::verify_signature(&deployer_pubkey, &message, &req.signature)
-            .map_err(|e| {
-                tracing::error!(
-                    app_id = %req.app_id,
-                    remote_addr = ?remote_addr,
-                    event = "SECRET_KEY_ACCESS_DENIED",
-                    reason = "signature verification error",
-                    error = %e,
-                    "Signature verification error"
-                );
-                Status::internal(format!("Signature verification error: {}", e))
-            })?;
-
-        if !signature_valid {
-            tracing::error!(
-                app_id = %req.app_id,
-                remote_addr = ?remote_addr,
-                source_type = source_type,
-                event = "SECRET_KEY_ACCESS_DENIED",
-                reason = "invalid deployer signature",
-                "Invalid deployer signature"
-            );
-
-            return Err(Status::permission_denied(
-                "Invalid deployer signature. Only the app deployer can access the private key.",
-            ));
-        }
-
-        // SECURITY: Log all successful private key access attempts
+        // SECURITY: Log all private key access attempts
         tracing::warn!(
             app_id = %req.app_id,
+            signer = ?signer,
             remote_addr = ?remote_addr,
             source_type = source_type,
-            deployer = %app_measurement.deployer,
             event = "SECRET_KEY_ACCESS",
             timestamp = %chrono::Utc::now(),
-            "Private key access attempt from allowed source with valid signature"
+            "Private key access attempt from allowed source"
         );
 
-        // Also get public key and address for response
-        let key_response = self
-            .app_key_service
-            .get_app_key(&req.app_id, "ethereum")
-            .await?;
+        // Create base measurement for this operation
+        let base_measurement = boot::AppMeasurement {
+            app_id: req.app_id.clone(),
+            operation: measurement_service::OPERATION_NAME_GET_APP_SECRET_KEY.to_string(),
+            result: String::new(),
+            error: None,
+            compose_hash: latest_measurement.compose_hash.clone(),
+            volumes_hash: latest_measurement.volumes_hash.clone(),
+            deployer: latest_measurement.deployer.clone(),
+            timestamp: utils::current_timestamp(),
+        };
 
-        // Get private key
-        let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
+        // Try to get the key
+        let result = async {
+            // Get public key and address for response
+            let key_response = self
+                .app_key_service
+                .get_app_key(&req.app_id, "ethereum")
+                .await?;
 
-        // SECURITY: Log successful retrieval
-        tracing::warn!(
-            app_id = %req.app_id,
-            remote_addr = ?remote_addr,
-            source_type = source_type,
-            event = "SECRET_KEY_RETRIEVED",
-            timestamp = %chrono::Utc::now(),
-            "Private key successfully retrieved"
-        );
+            // Get private key
+            let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
 
-        Ok(Response::new(GetAppSecretKeyResponse {
-            success: true,
-            message: format!("Private key for app {}", req.app_id),
-            private_key,
-            public_key: key_response.public_key,
-            eth_address: key_response.eth_address,
-        }))
+            Ok::<_, crate::error::TappError>((key_response, private_key))
+        }
+        .await;
+
+        // Mark measurement as success or failure
+        let final_measurement = match &result {
+            Ok(_) => base_measurement.with_success(),
+            Err(e) => base_measurement.with_failure(format!("{}", e)),
+        };
+
+        // Extend measurement (both success and failure)
+        let measurement_json = serde_json::to_string(&final_measurement)
+            .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_GET_APP_SECRET_KEY,
+                &measurement_json,
+            )
+            .await
+        {
+            tracing::error!("Failed to extend measurement for get_app_secret_key: {}", e);
+        }
+
+        // Handle result
+        match result {
+            Ok((key_response, private_key)) => {
+                // SECURITY: Log successful retrieval
+                tracing::warn!(
+                    app_id = %req.app_id,
+                    signer = ?signer,
+                    remote_addr = ?remote_addr,
+                    source_type = source_type,
+                    accessor = signer.as_deref().unwrap_or("unknown"),
+                    event = "SECRET_KEY_RETRIEVED",
+                    timestamp = %chrono::Utc::now(),
+                    "Private key successfully retrieved"
+                );
+
+                Ok(Response::new(GetAppSecretKeyResponse {
+                    success: true,
+                    message: format!("Private key for app {}", req.app_id),
+                    private_key,
+                    public_key: key_response.public_key,
+                    eth_address: key_response.eth_address,
+                }))
+            }
+            Err(e) => {
+                tracing::error!(
+                    app_id = %req.app_id,
+                    signer = ?signer,
+                    remote_addr = ?remote_addr,
+                    event = "SECRET_KEY_RETRIEVAL_FAILED",
+                    error = %e,
+                    "Failed to retrieve private key"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     async fn get_app_info(

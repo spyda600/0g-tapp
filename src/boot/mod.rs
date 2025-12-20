@@ -300,6 +300,15 @@ enable_eventlog = true
         result
     }
 
+    /// Get the latest measurement for a specific app
+    pub async fn get_latest_app_measurement(&self, app_id: &str) -> Option<AppMeasurement> {
+        let measurements = self.app_measurements.lock().await;
+        measurements
+            .get(app_id)
+            .and_then(|history| history.last())
+            .cloned()
+    }
+
     pub async fn get_evidence(
         &self,
         request: GetEvidenceRequest,
@@ -397,7 +406,6 @@ enable_eventlog = true
         ))
     }
 
-    /// Stop application
     pub async fn stop_app(&self, app_id: &str) -> TappResult<()> {
         info!(app_id = %app_id, "Stopping application");
 
@@ -458,21 +466,13 @@ enable_eventlog = true
             Err(e) => base_measurement.with_failure(format!("{}", e)),
         };
 
-        // Store measurement and extend runtime measurement (ONCE for both success/failure)
+        // Extend runtime measurement (but don't store in memory - stop doesn't change code)
         let measurement_json = serde_json::to_string(&final_measurement)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
 
         info!("stop_app measurement_json: {}", measurement_json);
 
-        // Store measurement in memory (append to history)
-        self.app_measurements
-            .lock()
-            .await
-            .entry(app_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(final_measurement.clone());
-
-        // Extend runtime measurement via measurement service
+        // Extend TEE measurement via measurement service
         if let Err(e) = self
             .measurement_service
             .extend_measurement(

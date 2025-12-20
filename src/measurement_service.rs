@@ -9,6 +9,7 @@ pub const ZGEL_DOMAIN: &str = "tapp.0g.com";
 // Operation names for measurements
 pub const OPERATION_NAME_START_APP: &str = "start_app";
 pub const OPERATION_NAME_STOP_APP: &str = "stop_app";
+pub const OPERATION_NAME_GET_APP_SECRET_KEY: &str = "get_app_secret_key";
 pub const OPERATION_NAME_ADD_TO_WHITELIST: &str = "add_to_whitelist";
 pub const OPERATION_NAME_REMOVE_FROM_WHITELIST: &str = "remove_from_whitelist";
 
