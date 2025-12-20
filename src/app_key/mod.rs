@@ -127,7 +127,7 @@ impl AppKeyService {
         if let Some(key_pair) = keys.get(app_id) {
             warn!(
                 app_id = %app_id,
-                "Private key retrieved - ensure this is for authorized CLI access only"
+                "Private key retrieved - ensure this is for local access only"
             );
             Ok(key_pair.private_key.clone())
         } else {
