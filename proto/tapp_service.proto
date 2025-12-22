@@ -225,8 +225,11 @@ message GetAppInfoResponse {
   string message = 2;
 
   string app_id = 3;
-  string compose_content = 5;
-  string volumes_content = 6;
+  string owner = 4;
+  string compose_hash = 5;
+  string volumes_hash = 6;
+  string compose_content = 7;
+  string volumes_content = 8;
 }
 
 // Service Status Messages

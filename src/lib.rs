@@ -270,46 +270,16 @@ impl TappService for TappServiceImpl {
         }
     }
 
+    // DEPRECATED: Removed since we no longer store measurement history in memory
+    // Only current running app info is stored in memory (app_info)
+    // Complete measurement history is in TEE measurements
     async fn list_app_measurements(
         &self,
-        request: Request<ListAppMeasurementsRequest>,
+        _request: Request<ListAppMeasurementsRequest>,
     ) -> Result<Response<ListAppMeasurementsResponse>, Status> {
-        let req = request.into_inner();
-
-        let deployer_filter = if req.deployer_filter.is_empty() {
-            None
-        } else {
-            Some(req.deployer_filter)
-        };
-
-        let measurements = self
-            .boot_service
-            .list_app_measurements(deployer_filter)
-            .await;
-
-        let measurement_infos: Vec<AppMeasurementInfo> = measurements
-            .iter()
-            .map(|m| AppMeasurementInfo {
-                app_id: m.app_id.clone(),
-                operation: m.operation.clone(),
-                result: m.result.clone(),
-                error: m.error.clone().unwrap_or_default(),
-                compose_hash: m.compose_hash.clone(),
-                volumes_hash: m.volumes_hash.clone(),
-                deployer: m.deployer.clone(),
-                timestamp: m.timestamp,
-            })
-            .collect();
-
-        let total_count = measurement_infos.len() as i32;
-
-        Ok(Response::new(ListAppMeasurementsResponse {
-            success: true,
-            message: format!("Found {} measurements", total_count),
-            measurements: measurement_infos,
-            total_count,
-            hash_algorithm: self.boot_service.get_hash_algorithm(),
-        }))
+        Err(Status::unimplemented(
+            "list_app_measurements is deprecated - use get_app_info for current running apps",
+        ))
     }
 
     async fn get_app_key(
@@ -387,17 +357,17 @@ impl TappService for TappServiceImpl {
             }
         }
 
-        // Get the app's latest measurement to get compose_hash, volumes_hash, deployer
-        let latest_measurement = self
+        // Get the app info to get compose_hash, volumes_hash, deployer
+        let app_info = self
             .boot_service
-            .get_latest_app_measurement(&req.app_id)
-            .await
+            .get_app_info(&req.app_id)
+            .await?
             .ok_or_else(|| {
-                tracing::error!(
+                tracing::warn!(
                     app_id = %req.app_id,
                     event = "SECRET_KEY_ACCESS_DENIED",
                     reason = "app not found",
-                    "App not found in measurements"
+                    "App not found"
                 );
                 Status::not_found(format!("App {} not found", req.app_id))
             })?;
@@ -419,9 +389,9 @@ impl TappService for TappServiceImpl {
             operation: measurement_service::OPERATION_NAME_GET_APP_SECRET_KEY.to_string(),
             result: String::new(),
             error: None,
-            compose_hash: latest_measurement.compose_hash.clone(),
-            volumes_hash: latest_measurement.volumes_hash.clone(),
-            deployer: latest_measurement.deployer.clone(),
+            compose_hash: app_info.compose_content.hash.clone(),
+            volumes_hash: app_info.mount_files.hash.clone(),
+            deployer: app_info.owner.clone(),
             timestamp: utils::current_timestamp(),
         };
 
@@ -505,14 +475,9 @@ impl TappService for TappServiceImpl {
         let req = request.into_inner();
         let app_id = req.app_id;
 
-        let compose_content = self.boot_service.get_app_compose_content(&app_id).await?;
-        let volumes_content = self.boot_service.get_app_mount_files(&app_id).await?;
+        let app_info = self.boot_service.get_app_info(&app_id).await?;
 
-        let compose_content = compose_content.ok_or(TappError::InvalidParameter {
-            field: "app_id".to_string(),
-            reason: format!("App {} not found", app_id),
-        })?;
-        let volumes_content = volumes_content.ok_or(TappError::InvalidParameter {
+        let app_info = app_info.ok_or(TappError::InvalidParameter {
             field: "app_id".to_string(),
             reason: format!("App {} not found", app_id),
         })?;
@@ -521,8 +486,11 @@ impl TappService for TappServiceImpl {
             success: true,
             message: format!("App info for {}", app_id),
             app_id,
-            compose_content,
-            volumes_content,
+            owner: app_info.owner,
+            compose_hash: app_info.compose_content.hash,
+            volumes_hash: app_info.mount_files.hash,
+            compose_content: app_info.compose_content.content,
+            volumes_content: app_info.mount_files.content,
         }))
     }
 

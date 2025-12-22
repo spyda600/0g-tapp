@@ -143,37 +143,26 @@ echo ""
 echo "Querying app info..."
 echo ""
 
-# Build request JSON
-request_json=$(jq -n \
-  --arg app_id "$APP_ID" \
-  '{
-    app_id: $app_id
-  }')
-
-echo "Request:"
-echo "--------------------------------------"
-echo "$request_json"
-echo "--------------------------------------"
-echo ""
-
-# Call gRPC service
+# Call gRPC service and capture both stdout and stderr
+set +e  # Don't exit on error
 response=$(grpcurl -plaintext \
-  -import-path "$SCRIPT_DIR/../proto" \
-  -proto tapp_service.proto \
-  -d "{
-    \"app_id\": \"$APP_ID\"
-  }" \
-  "$TARGET_ADDRESS" \
-  tapp_service.TappService/GetAppInfo 2>&1)
+    -import-path "$SCRIPT_DIR/../proto" \
+    -proto tapp_service.proto \
+    -d "{
+        \"app_id\": \"$APP_ID\"
+    }" \
+    "$TARGET_ADDRESS" \
+    tapp_service.TappService/GetAppInfo 2>&1)
+exit_code=$?
+set -e
 
-# Debug: Show raw response length
-response_length=${#response}
-echo "Debug: Raw response length = $response_length bytes"
+echo "Debug: grpcurl exit code = $exit_code"
+echo "Debug: response length = ${#response} bytes"
 echo ""
 
-# Check if request was successful
-if echo "$response" | grep -q "Code:"; then
-    echo "❌ Request failed:"
+# Check exit code
+if [ $exit_code -ne 0 ]; then
+    echo "❌ grpcurl failed with exit code: $exit_code"
     echo "--------------------------------------"
     echo "$response"
     echo "--------------------------------------"
@@ -181,15 +170,24 @@ if echo "$response" | grep -q "Code:"; then
 fi
 
 # Check if response is empty
-if [ -z "$response" ] || [ "$response_length" -lt 3 ]; then
-    echo "⚠️  Empty response received from server"
+if [ -z "$response" ] || [ ${#response} -lt 3 ]; then
+    echo "⚠️  Empty or very short response received from server"
+    echo "Raw response: '$response'"
+    echo ""
     echo "This could mean:"
     echo "  • The application '$APP_ID' does not exist"
-    echo "  • The server returned an empty response (no error, no data)"
+    echo "  • The server returned an empty response"
     echo "  • Network/connection issue"
-    echo ""
-    echo "Raw response: '$response'"
     exit 0
+fi
+
+# Check if request failed with gRPC error
+if echo "$response" | grep -q "Code:"; then
+    echo "❌ Request failed:"
+    echo "--------------------------------------"
+    echo "$response"
+    echo "--------------------------------------"
+    exit 1
 fi
 
 echo "Response:"

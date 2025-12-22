@@ -15,14 +15,32 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
+#[derive(Clone)]
+pub struct AppComposeContent {
+    pub hash: String,
+    pub content: String,
+}
+
+#[derive(Clone)]
+pub struct AppMountFiles {
+    pub hash: String,
+    pub content: String,
+}
+
+#[derive(Clone)]
+pub struct AppInfo {
+    pub app_id: String,
+    pub owner: String,
+    pub compose_content: AppComposeContent,
+    pub mount_files: AppMountFiles,
+}
+
 pub struct BootService {
     config: BootServiceConfig,
     manager: Mutex<DockerComposeManager>,
-    app_measurements: Mutex<HashMap<String, Vec<AppMeasurement>>>,
+    app_info: Mutex<HashMap<String, AppInfo>>,
     measurement_service: Arc<MeasurementService>,
     task_manager: Arc<TaskManager>,
-    app_compose_content: Mutex<HashMap<String, String>>,
-    app_mount_files: Mutex<HashMap<String, String>>,
 }
 
 impl BootService {
@@ -73,17 +91,50 @@ enable_eventlog = true
         Ok(Self {
             config: config.clone(),
             manager: Mutex::new(manager),
-            app_measurements: Mutex::new(HashMap::new()),
+            app_info: Mutex::new(HashMap::new()),
             measurement_service,
             task_manager,
-            app_compose_content: Mutex::new(HashMap::new()),
-            app_mount_files: Mutex::new(HashMap::new()),
         })
     }
 
     /// Internal method to handle the actual app start logic
     async fn _start_app(&self, request: StartAppRequest, deployer: String, task_id: String) {
         let app_id = request.app_id.clone();
+
+        // Check if app already exists
+        {
+            let app_info_lock = self.app_info.lock().await;
+            if let Some(existing_info) = app_info_lock.get(&app_id) {
+                // If hash is not empty, app is still running
+                if !existing_info.compose_content.hash.is_empty() {
+                    let error_msg = format!("App {} is already running", app_id);
+                    tracing::error!(app_id = %app_id, "App already running");
+                    self.task_manager.mark_failed(&task_id, error_msg).await;
+                    return;
+                }
+                // If hash is empty, app is stopped, check if same owner
+                if existing_info.owner != deployer {
+                    let error_msg = format!(
+                        "App {} was deployed by different owner: {} (current: {})",
+                        app_id, existing_info.owner, deployer
+                    );
+                    tracing::error!(
+                        app_id = %app_id,
+                        existing_owner = %existing_info.owner,
+                        current_deployer = %deployer,
+                        "Owner mismatch for stopped app"
+                    );
+                    self.task_manager.mark_failed(&task_id, error_msg).await;
+                    return;
+                }
+                // Same owner restarting stopped app - OK to proceed
+                info!(
+                    app_id = %app_id,
+                    owner = %deployer,
+                    "Restarting stopped app with same owner"
+                );
+            }
+        }
 
         // Convert proto MountFile to our MountFile structure (needed for both success and failure)
         let mount_files: Vec<MountFile> = request
@@ -125,24 +176,12 @@ enable_eventlog = true
 
         // Try to start the application
         let result = async {
-            let app_id = request.app_id.clone();
             info!(
                 task_id = %task_id,
                 app_id = %app_id,
                 mount_files_count = request.mount_files.len(),
                 "Starting application with Docker Compose"
             );
-
-            // Store compose content and mount files
-            self.app_compose_content
-                .lock()
-                .await
-                .insert(app_id.clone(), compose_content);
-
-            self.app_mount_files
-                .lock()
-                .await
-                .insert(app_id.clone(), volumes_content);
 
             // Start the Docker Compose application with mount files
             DockerComposeManager::deploy_compose(&app_id, &request.compose_content, &mount_files)
@@ -154,9 +193,13 @@ enable_eventlog = true
                 "Application started successfully"
             );
 
-            Ok::<_, crate::error::TappError>((app_id, deployer.clone()))
+            Ok::<_, crate::error::TappError>(())
         }
         .await;
+
+        // Save values from base_measurement before it's moved
+        let compose_hash = base_measurement.compose_hash.clone();
+        let volumes_hash = base_measurement.volumes_hash.clone();
 
         // Mark measurement as success or failure based on result
         let final_measurement = match &result {
@@ -164,21 +207,12 @@ enable_eventlog = true
             Err(e) => base_measurement.with_failure(format!("{}", e)),
         };
 
-        // Store measurement and extend runtime measurement (ONCE for both success/failure)
+        // Extend runtime measurement (ONCE for both success/failure)
         let measurement_json = serde_json::to_string(&final_measurement)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
 
         info!("measurement_json: {}", measurement_json);
 
-        // Store measurement in memory (append to history)
-        self.app_measurements
-            .lock()
-            .await
-            .entry(app_id.clone())
-            .or_insert_with(Vec::new)
-            .push(final_measurement.clone());
-
-        // Extend runtime measurement via measurement service
         if let Err(e) = self
             .measurement_service
             .extend_measurement(
@@ -190,14 +224,42 @@ enable_eventlog = true
             tracing::error!("Failed to extend measurement: {}", e);
         }
 
-        // Update task status based on result
+        // Handle result: store AppInfo on success, cleanup on failure
         match result {
-            Ok((app_id, deployer)) => {
+            Ok(_) => {
+                // Store AppInfo in memory (only on success)
+                let app_info = AppInfo {
+                    app_id: app_id.clone(),
+                    owner: deployer.clone(),
+                    compose_content: AppComposeContent {
+                        hash: compose_hash,
+                        content: compose_content,
+                    },
+                    mount_files: AppMountFiles {
+                        hash: volumes_hash,
+                        content: volumes_content,
+                    },
+                };
+
+                self.app_info.lock().await.insert(app_id.clone(), app_info);
+
+                // Mark task as completed
                 self.task_manager
                     .mark_completed(&task_id, TaskSuccessResult { app_id, deployer })
                     .await;
             }
             Err(e) => {
+                // Cleanup: stop and remove containers on failure
+                // Note: Failed start already measured above (line 165 + 175-184)
+                if let Err(cleanup_err) = DockerComposeManager::stop_compose(&app_id).await {
+                    tracing::error!(
+                        app_id = %app_id,
+                        error = %cleanup_err,
+                        "Failed to cleanup containers after deployment failure"
+                    );
+                }
+
+                // Mark task as failed
                 self.task_manager
                     .mark_failed(&task_id, format!("{}", e))
                     .await;
@@ -268,45 +330,6 @@ enable_eventlog = true
         service_name: Option<&str>,
     ) -> TappResult<String> {
         DockerComposeManager::get_app_logs(app_id, lines, service_name).await
-    }
-
-    /// List all app measurements (returns all historical measurements)
-    pub async fn list_app_measurements(
-        &self,
-        deployer_filter: Option<String>,
-    ) -> Vec<AppMeasurement> {
-        let measurements = self.app_measurements.lock().await;
-
-        // Flatten all measurement histories into a single vec
-        let mut result: Vec<AppMeasurement> = measurements
-            .values()
-            .flatten()
-            .filter(|m| {
-                // Apply deployer filter if provided
-                if let Some(ref filter) = deployer_filter {
-                    // Filter can be with or without 0x prefix
-                    let filter_normalized = filter.trim_start_matches("0x").to_lowercase();
-                    m.deployer.to_lowercase().contains(&filter_normalized)
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-
-        // Sort by timestamp descending (newest first)
-        result.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-        result
-    }
-
-    /// Get the latest measurement for a specific app
-    pub async fn get_latest_app_measurement(&self, app_id: &str) -> Option<AppMeasurement> {
-        let measurements = self.app_measurements.lock().await;
-        measurements
-            .get(app_id)
-            .and_then(|history| history.last())
-            .cloned()
     }
 
     pub async fn get_evidence(
@@ -409,34 +432,32 @@ enable_eventlog = true
     pub async fn stop_app(&self, app_id: &str) -> TappResult<()> {
         info!(app_id = %app_id, "Stopping application");
 
-        // Get the latest measurement for this app (to use for stop operation measurement)
-        let base_measurement = {
-            let measurements = self.app_measurements.lock().await;
-            if let Some(history) = measurements.get(app_id) {
-                if let Some(latest) = history.last() {
-                    // Create a new measurement for stop operation based on the latest one
-                    AppMeasurement {
-                        app_id: app_id.to_string(),
-                        operation: crate::measurement_service::OPERATION_NAME_STOP_APP.to_string(),
-                        result: String::new(),
-                        error: None,
-                        compose_hash: latest.compose_hash.clone(),
-                        volumes_hash: latest.volumes_hash.clone(),
-                        deployer: latest.deployer.clone(),
-                        timestamp: crate::utils::current_timestamp(),
-                    }
-                } else {
-                    return Err(TappError::InvalidParameter {
-                        field: "app_id".to_string(),
-                        reason: format!("No measurement found for app {}", app_id),
-                    });
-                }
-            } else {
+        // Get AppInfo for this app (to use for stop operation measurement)
+        let app_info = {
+            let app_info_lock = self.app_info.lock().await;
+            app_info_lock.get(app_id).cloned()
+        };
+
+        let app_info = match app_info {
+            Some(info) => info,
+            None => {
                 return Err(TappError::InvalidParameter {
                     field: "app_id".to_string(),
-                    reason: format!("No measurement found for app {}", app_id),
+                    reason: format!("App {} not found or not running", app_id),
                 });
             }
+        };
+
+        // Create measurement for stop operation based on app info
+        let base_measurement = AppMeasurement {
+            app_id: app_id.to_string(),
+            operation: crate::measurement_service::OPERATION_NAME_STOP_APP.to_string(),
+            result: String::new(),
+            error: None,
+            compose_hash: app_info.compose_content.hash.clone(),
+            volumes_hash: app_info.mount_files.hash.clone(),
+            deployer: app_info.owner.clone(),
+            timestamp: crate::utils::current_timestamp(),
         };
 
         // Try to stop the application
@@ -466,13 +487,12 @@ enable_eventlog = true
             Err(e) => base_measurement.with_failure(format!("{}", e)),
         };
 
-        // Extend runtime measurement (but don't store in memory - stop doesn't change code)
+        // Extend runtime measurement
         let measurement_json = serde_json::to_string(&final_measurement)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
 
         info!("stop_app measurement_json: {}", measurement_json);
 
-        // Extend TEE measurement via measurement service
         if let Err(e) = self
             .measurement_service
             .extend_measurement(
@@ -484,20 +504,26 @@ enable_eventlog = true
             tracing::error!("Failed to extend measurement for stop operation: {}", e);
         }
 
-        info!(app_id = %app_id, "Application stopped successfully");
+        // Clear hash info on successful stop (keep owner info for permission checks)
+        if result.is_ok() {
+            let mut app_info_lock = self.app_info.lock().await;
+            if let Some(info) = app_info_lock.get_mut(app_id) {
+                // Clear hash and content to indicate app is stopped
+                info.compose_content.hash.clear();
+                info.compose_content.content.clear();
+                info.mount_files.hash.clear();
+                info.mount_files.content.clear();
+            }
+            info!(app_id = %app_id, "Application stopped successfully, hash info cleared");
+        }
 
         // Return the original result
         result
     }
 
-    pub async fn get_app_compose_content(&self, app_id: &str) -> TappResult<Option<String>> {
-        let compose_content = self.app_compose_content.lock().await.get(app_id).cloned();
-        Ok(compose_content)
-    }
-
-    pub async fn get_app_mount_files(&self, app_id: &str) -> TappResult<Option<String>> {
-        let mount_files = self.app_mount_files.lock().await.get(app_id).cloned();
-        Ok(mount_files)
+    pub async fn get_app_info(&self, app_id: &str) -> TappResult<Option<AppInfo>> {
+        let app_info = self.app_info.lock().await;
+        Ok(app_info.get(app_id).cloned())
     }
 }
 

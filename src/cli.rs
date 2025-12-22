@@ -2,9 +2,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tapp_service::proto::{
     tapp_service_client::TappServiceClient, GetAppKeyRequest, GetAppSecretKeyRequest,
-    GetEvidenceRequest, MountFile, StartAppRequest,
+    GetEvidenceRequest, MountFile, StartAppRequest, StopAppRequest,
 };
-use tonic::Request;
+use tonic::{metadata::MetadataValue, Request};
 
 #[derive(Parser)]
 #[command(name = "tapp-cli")]
@@ -34,6 +34,21 @@ enum Commands {
         /// Example: ./nginx.conf:/path/to/nginx.conf:0644
         #[arg(short, long)]
         mount: Vec<String>,
+
+        /// Deployer's private key (32 bytes hex, with or without 0x prefix)
+        #[arg(short = 'k', long)]
+        private_key: String,
+    },
+
+    /// Stop a running application
+    StopApp {
+        /// Application ID to stop
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Deployer's private key (32 bytes hex, with or without 0x prefix)
+        #[arg(short = 'k', long)]
+        private_key: String,
     },
 
     /// Get attestation evidence with custom report data
@@ -106,8 +121,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             compose_file,
             app_id,
             mount,
+            private_key,
         } => {
-            start_app(&cli.server, compose_file, app_id, mount).await?;
+            start_app(&cli.server, compose_file, app_id, mount, private_key).await?;
+        }
+        Commands::StopApp {
+            app_id,
+            private_key,
+        } => {
+            stop_app(&cli.server, app_id, private_key).await?;
         }
         Commands::GetEvidence { report_data } => {
             get_evidence(&cli.server, report_data).await?;
@@ -145,6 +167,7 @@ async fn start_app(
     compose_file: PathBuf,
     app_id: String,
     mounts: Vec<String>,
+    private_key_hex: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = TappServiceClient::connect(server.to_string()).await?;
 
@@ -177,11 +200,15 @@ async fn start_app(
         });
     }
 
-    let request = Request::new(StartAppRequest {
+    // Create authenticated request with signature
+    let mut request = Request::new(StartAppRequest {
         compose_content,
         app_id: app_id.clone(),
         mount_files,
     });
+
+    // Add signature metadata
+    add_signature_metadata(&mut request, &private_key_hex, "StartApp")?;
 
     let response = client.start_app(request).await?;
     let result = response.into_inner();
@@ -498,6 +525,82 @@ fn verify_signature(
         println!("  Public Key: 0x{}", public_key_hex);
         std::process::exit(1);
     }
+
+    Ok(())
+}
+
+async fn stop_app(
+    server: &str,
+    app_id: String,
+    private_key_hex: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+
+    // Create authenticated request with signature
+    let mut request = Request::new(StopAppRequest {
+        app_id: app_id.clone(),
+    });
+
+    // Add signature metadata
+    add_signature_metadata(&mut request, &private_key_hex, "StopApp")?;
+
+    let response = client.stop_app(request).await?;
+    let result = response.into_inner();
+
+    if result.success {
+        println!("✓ Application stopped successfully");
+        println!("  App ID: {}", app_id);
+        println!("  Message: {}", result.message);
+        println!("  Timestamp: {}", result.timestamp);
+    } else {
+        eprintln!("ERROR: Failed to stop application");
+        eprintln!("  Message: {}", result.message);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Add signature metadata to a gRPC request for authentication
+fn add_signature_metadata<T>(
+    request: &mut Request<T>,
+    private_key_hex: &str,
+    method_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Remove 0x prefix if present
+    let private_key_hex = private_key_hex
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+
+    if private_key_hex.len() != 64 {
+        eprintln!(
+            "ERROR: Private key must be 32 bytes (64 hex characters), got {}",
+            private_key_hex.len()
+        );
+        std::process::exit(1);
+    }
+
+    let private_key = hex::decode(private_key_hex)?;
+
+    // Get current timestamp
+    let timestamp = chrono::Utc::now().timestamp();
+
+    // Build message to sign: method_name:timestamp
+    let message = format!("{}:{}", method_name, timestamp);
+    let message_bytes = message.as_bytes();
+
+    // Sign the message
+    let signature = tapp_service::app_key::sign_message(&private_key, message_bytes)?;
+    let signature_hex = hex::encode(&signature);
+
+    // Add metadata to request
+    request
+        .metadata_mut()
+        .insert("x-signature", MetadataValue::try_from(signature_hex)?);
+    request.metadata_mut().insert(
+        "x-timestamp",
+        MetadataValue::try_from(timestamp.to_string())?,
+    );
 
     Ok(())
 }
