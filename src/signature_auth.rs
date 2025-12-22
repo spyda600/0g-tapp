@@ -5,8 +5,8 @@ use sha3::{Digest, Keccak256};
 /// Ethereum signature format: 65 bytes (r: 32 bytes, s: 32 bytes, v: 1 byte)
 const SIGNATURE_LENGTH: usize = 65;
 
-/// Maximum timestamp difference allowed (5 minutes in seconds)
-pub const MAX_TIMESTAMP_DIFF: i64 = 300;
+/// Maximum timestamp difference allowed (120 seconds)
+pub const MAX_TIMESTAMP_DIFF: i64 = 120;
 
 /// Recover EVM address from signature
 ///
