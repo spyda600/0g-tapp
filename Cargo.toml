@@ -45,6 +45,7 @@ sha3 = "0.10"
 hex = "0.4"
 ring = "0.17"
 k256 = { version = "0.13", features = ["ecdsa", "std"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 # Error handling and logging
 anyhow = "1.0"

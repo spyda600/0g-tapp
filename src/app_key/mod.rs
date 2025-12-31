@@ -3,9 +3,7 @@ pub use kbs_client::KbsClient;
 
 use crate::config::KbsConfig;
 use crate::error::{DockerError, TappResult};
-use crate::proto::GetAppKeyResponse;
 use k256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -13,10 +11,11 @@ use tracing::{debug, info, warn};
 
 /// Ethereum key pair
 #[derive(Clone)]
-struct EthKeyPair {
-    private_key: Vec<u8>, // 32-byte private key (can be used to reconstruct SigningKey)
-    public_key: Vec<u8>,  // 64-byte uncompressed public key (without 0x04 prefix)
-    eth_address: Vec<u8>, // 20-byte Ethereum address
+pub struct EthKeyPair {
+    pub private_key: Vec<u8>, // 32-byte private key (can be used to reconstruct SigningKey)
+    pub public_key: Vec<u8>,  // 64-byte uncompressed public key (without 0x04 prefix)
+    pub eth_address: Vec<u8>, // 20-byte Ethereum address
+    pub x25519_public_key: Option<Vec<u8>>, // 32-byte X25519 public key
 }
 
 /// Application key service implementation
@@ -56,7 +55,7 @@ impl AppKeyService {
     }
 
     /// Generate a new Ethereum key pair for an app
-    fn generate_eth_keypair(app_id: &str) -> TappResult<EthKeyPair> {
+    fn generate_eth_keypair(x25519: bool) -> TappResult<EthKeyPair> {
         use k256::elliptic_curve::rand_core::OsRng;
 
         let signing_key = SigningKey::random(&mut OsRng);
@@ -73,28 +72,45 @@ impl AppKeyService {
         // Store complete public key (with prefix) if needed
         let public_key = public_key_bytes.to_vec();
 
+        // Generate x25519 key pair if requested
+        // Compatible with eciesjs: directly use secp256k1 private key as x25519 private key
+        let x25519_public_key = if x25519 {
+            // Convert secp256k1 private key to x25519 private key
+            // eciesjs uses the same 32-byte private key for both secp256k1 and x25519
+            let mut x25519_private_bytes = [0u8; 32];
+            x25519_private_bytes.copy_from_slice(&private_key[..32]);
+
+            // Create x25519 secret from the same private key
+            let x25519_secret = x25519_dalek::StaticSecret::from(x25519_private_bytes);
+
+            // Derive x25519 public key
+            let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
+
+            Some(x25519_public.as_bytes().to_vec())
+        } else {
+            None
+        };
+
         // Calculate Ethereum address from 64-byte public key (without prefix)
         let mut hasher = Keccak256::new();
         hasher.update(public_key_without_prefix);
         let hash = hasher.finalize();
         let eth_address = hash[12..].to_vec(); // Last 20 bytes
 
-        debug!(
-            app_id = %app_id,
-            public_key_hex = %hex::encode(&public_key),
-            eth_address_hex = %format!("0x{}", hex::encode(&eth_address)),
-            "Generated new Ethereum key pair"
-        );
-
         Ok(EthKeyPair {
             private_key,
             public_key,
             eth_address,
+            x25519_public_key,
         })
     }
 
     /// Get or create key for an app (in-memory mode)
-    async fn get_or_create_in_memory_key(&self, app_id: &str) -> TappResult<EthKeyPair> {
+    async fn get_or_create_in_memory_key(
+        &self,
+        app_id: &str,
+        x25519: bool,
+    ) -> TappResult<EthKeyPair> {
         let mut keys = self.app_keys.lock().await;
 
         if let Some(key_pair) = keys.get(app_id) {
@@ -103,8 +119,12 @@ impl AppKeyService {
         }
 
         // Generate new key
-        info!(app_id = %app_id, "Generating new in-memory key");
-        let key_pair = Self::generate_eth_keypair(app_id)?;
+        info!(
+            app_id = %app_id,
+            x25519_enabled = x25519,
+            "Generating new in-memory key"
+        );
+        let key_pair = Self::generate_eth_keypair(x25519)?;
 
         // Store it
         keys.insert(app_id.to_string(), key_pair.clone());
@@ -112,7 +132,7 @@ impl AppKeyService {
         Ok(key_pair)
     }
 
-    /// Get private key for an app (internal use only - for CLI)
+    /// Get private key for an app (internal use only)
     /// WARNING: This returns sensitive private key material
     pub async fn get_private_key(&self, app_id: &str) -> TappResult<Vec<u8>> {
         if !self.use_in_memory {
@@ -138,8 +158,41 @@ impl AppKeyService {
         }
     }
 
+    /// Get public key for an app (internal use only)
+    pub async fn get_public_key(
+        &self,
+        app_id: &str,
+    ) -> TappResult<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+        if !self.use_in_memory {
+            return Err(DockerError::ContainerOperationFailed {
+                operation: "get_public_key".to_string(),
+                reason: "Public key retrieval only supported in in-memory mode".to_string(),
+            }
+            .into());
+        }
+
+        let keys = self.app_keys.lock().await;
+        if let Some(key_pair) = keys.get(app_id) {
+            Ok((
+                key_pair.eth_address.clone(),
+                key_pair.public_key.clone(),
+                key_pair.x25519_public_key.clone(),
+            ))
+        } else {
+            Err(DockerError::ServiceNotFound {
+                service_name: format!("Key for app_id: {}", app_id),
+            }
+            .into())
+        }
+    }
+
     /// Handle get app key request (public key only - for gRPC)
-    pub async fn get_app_key(&self, app_id: &str, key_type: &str) -> TappResult<GetAppKeyResponse> {
+    pub async fn get_app_key(
+        &self,
+        app_id: &str,
+        key_type: &str,
+        x25519: bool,
+    ) -> TappResult<EthKeyPair> {
         info!(
             app_id = %app_id,
             key_type = %key_type,
@@ -151,15 +204,15 @@ impl AppKeyService {
             // Use in-memory key generation
             match key_type {
                 "ethereum" => {
-                    let key_pair = self.get_or_create_in_memory_key(app_id).await?;
-
-                    Ok(GetAppKeyResponse {
-                        success: true,
-                        message: format!("In-memory Ethereum key for app {}", app_id),
-                        public_key: key_pair.public_key.clone(),
-                        eth_address: key_pair.eth_address.clone(),
-                        key_source: "in-memory".to_string(),
-                    })
+                    let key_pair = self.get_or_create_in_memory_key(app_id, x25519).await?;
+                    info!(
+                        app_id = %app_id,
+                        public_key_hex = format!("0x{}", hex::encode(&key_pair.public_key)),
+                        eth_address_hex = format!("0x{}", hex::encode(&key_pair.eth_address)),
+                        x25519_public_key_hex = format!("0x{:?}", key_pair.x25519_public_key),
+                        "Generated new Ethereum key pair"
+                    );
+                    Ok(key_pair)
                 }
                 _ => {
                     warn!(key_type = %key_type, "Unsupported key type for in-memory mode");
@@ -182,12 +235,11 @@ impl AppKeyService {
 
             let resource_uri = format!("kbs:///default/key/{}", app_id);
             match kbs_client.get_resource(&resource_uri).await {
-                Ok(key_data) => Ok(GetAppKeyResponse {
-                    success: true,
-                    message: format!("Key from KBS for app {}", app_id),
-                    public_key: key_data,
+                Ok(_key_data) => Ok(EthKeyPair {
+                    private_key: vec![],
+                    public_key: _key_data,
                     eth_address: vec![],
-                    key_source: "kbs".to_string(),
+                    x25519_public_key: None,
                 }),
                 Err(e) => {
                     tracing::error!(
@@ -261,7 +313,7 @@ mod tests {
     #[test]
     fn test_sign_and_verify() {
         // Generate a test key pair
-        let key_pair = AppKeyService::generate_eth_keypair("test-app").unwrap();
+        let key_pair = AppKeyService::generate_eth_keypair(true).unwrap();
 
         // Test message
         let message = b"Hello, TAPP!";

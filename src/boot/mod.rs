@@ -211,7 +211,7 @@ enable_eventlog = true
         let measurement_json = serde_json::to_string(&final_measurement)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
 
-        info!("measurement_json: {}", measurement_json);
+        // info!("measurement_json: {}", measurement_json);
 
         if let Err(e) = self
             .measurement_service
@@ -250,7 +250,12 @@ enable_eventlog = true
             }
             Err(e) => {
                 // Cleanup: stop and remove containers on failure
-                // Note: Failed start already measured above (line 165 + 175-184)
+                // Note: Failed start already measured above
+                tracing::error!(
+                    app_id = %app_id,
+                    error = %e,
+                    "Failed to start application, cleanup containers"
+                );
                 if let Err(cleanup_err) = DockerComposeManager::stop_compose(&app_id).await {
                     tracing::error!(
                         app_id = %app_id,

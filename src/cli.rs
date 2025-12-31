@@ -282,6 +282,7 @@ async fn get_app_key(
         key_type: key_type.clone(),
         additional_data: vec![],
         kbs_resource_uri: String::new(),
+        x25519: true,
     });
 
     let response = client.get_app_key(request).await?;
@@ -347,6 +348,8 @@ async fn get_app_secret_key(
 
     let request = Request::new(GetAppSecretKeyRequest {
         app_id: app_id.clone(),
+        key_type: "ethereum".to_string(),
+        x25519: true,
     });
 
     // Server will validate signature and that the connection is from localhost

@@ -14,6 +14,7 @@ pub use boot::BootService;
 pub use config::TappConfig;
 pub use error::{TappError, TappResult};
 use std::sync::Arc;
+pub use task_manager::TaskStatus;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
@@ -249,15 +250,24 @@ impl TappService for TappServiceImpl {
         let req = request.into_inner();
 
         match self.boot_service.get_task_status(&req.task_id).await {
-            Some(task) => Ok(Response::new(GetTaskStatusResponse {
-                success: true,
-                message: "Task found".to_string(),
-                task_id: task.id.clone(),
-                status: task.to_proto_status() as i32,
-                result: task.to_proto_result(),
-                created_at: task.created_at,
-                updated_at: task.updated_at,
-            })),
+            Some(task) => {
+                let is_success = matches!(task.status, TaskStatus::Completed(_));
+
+                Ok(Response::new(GetTaskStatusResponse {
+                    success: is_success,
+                    message: match &task.status {
+                        TaskStatus::Pending => "Task is pending".to_string(),
+                        TaskStatus::Running => "Task is running".to_string(),
+                        TaskStatus::Completed(_) => "Task completed successfully".to_string(),
+                        TaskStatus::Failed(err) => format!("Task failed: {}", err),
+                    },
+                    task_id: task.id.clone(),
+                    status: task.to_proto_status() as i32,
+                    result: task.to_proto_result(),
+                    created_at: task.created_at,
+                    updated_at: task.updated_at,
+                }))
+            }
             None => Ok(Response::new(GetTaskStatusResponse {
                 success: false,
                 message: format!("Task not found: {}", req.task_id),
@@ -295,11 +305,15 @@ impl TappService for TappServiceImpl {
             &req.key_type
         };
 
-        let response = self
-            .app_key_service
-            .get_app_key(&req.app_id, key_type)
-            .await?;
-        Ok(Response::new(response))
+        let response = self.app_key_service.get_public_key(&req.app_id).await?;
+        Ok(Response::new(GetAppKeyResponse {
+            success: true,
+            message: format!("Public key for app {}", req.app_id),
+            eth_address: response.0,
+            public_key: response.1,
+            x25519_public_key: response.2.unwrap_or_default(),
+            key_source: "in-memory".to_string(),
+        }))
     }
 
     async fn get_app_secret_key(
@@ -336,6 +350,10 @@ impl TappService for TappServiceImpl {
         // Get signer address from signature (handled by AuthLayer)
         let signer = auth_layer::get_signer_address(&request);
         let req = request.into_inner();
+        let mut key_type = "ethereum".to_string();
+        if !req.key_type.is_empty() {
+            key_type = req.key_type;
+        }
 
         // SECURITY: Check app ownership
         if let Some(pm) = &self.permission_manager {
@@ -400,13 +418,13 @@ impl TappService for TappServiceImpl {
             // Get public key and address for response
             let key_response = self
                 .app_key_service
-                .get_app_key(&req.app_id, "ethereum")
+                .get_app_key(&req.app_id, &key_type, req.x25519)
                 .await?;
 
             // Get private key
-            let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
+            // let private_key = self.app_key_service.get_private_key(&req.app_id).await?;
 
-            Ok::<_, crate::error::TappError>((key_response, private_key))
+            Ok::<_, crate::error::TappError>(key_response)
         }
         .await;
 
@@ -433,7 +451,7 @@ impl TappService for TappServiceImpl {
 
         // Handle result
         match result {
-            Ok((key_response, private_key)) => {
+            Ok(key_response) => {
                 // SECURITY: Log successful retrieval
                 tracing::warn!(
                     app_id = %req.app_id,
@@ -449,9 +467,10 @@ impl TappService for TappServiceImpl {
                 Ok(Response::new(GetAppSecretKeyResponse {
                     success: true,
                     message: format!("Private key for app {}", req.app_id),
-                    private_key,
+                    private_key: key_response.private_key,
                     public_key: key_response.public_key,
                     eth_address: key_response.eth_address,
+                    x25519_public_key: key_response.x25519_public_key.unwrap_or_default(),
                 }))
             }
             Err(e) => {

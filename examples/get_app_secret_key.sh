@@ -22,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_HOST="localhost"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID=""
+DEFAULT_X25519=true
 
 # Pre-configured addresses (for reference only)
 OWNER_ADDRESS="0xea695C312CE119dE347425B29AFf85371c9d1837"
@@ -41,6 +42,7 @@ APP_ID=""
 PRIVATE_KEY=""
 USE_OWNER=false
 USE_WHITELIST=false
+X25519=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -68,6 +70,10 @@ while [[ $# -gt 0 ]]; do
             USE_WHITELIST=true
             shift
             ;;
+        --x25519)
+            X25519=true
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -78,6 +84,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --private-key KEY       Private key for signing (required unless using presets)"
             echo "  --use-owner             Use pre-configured owner credentials (requires TAPP_OWNER_PRIVATE_KEY env var)"
             echo "  --use-whitelist         Use pre-configured whitelist user credentials (requires TAPP_WHITELIST_PRIVATE_KEY env var)"
+            echo "  --x25519                Use X25519 key pair (default: $DEFAULT_X25519)"
             echo "  --help, -h              Show this help message"
             echo ""
             echo "Environment variables:"
@@ -87,6 +94,7 @@ while [[ $# -gt 0 ]]; do
             echo "Examples:"
             echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --use-owner"
             echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --use-whitelist"
+            echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --use-whitelist --x25519"
             echo ""
             echo "⚠️  SECURITY WARNING:"
             echo "  This command retrieves the APPLICATION'S PRIVATE KEY."
@@ -301,8 +309,10 @@ echo ""
 # Create request JSON
 request_json=$(jq -n \
     --arg app_id "$APP_ID" \
+    --arg x25519 "$X25519" \
     '{
-        app_id: $app_id
+        app_id: $app_id,
+        x25519: $x25519
     }')
 
 echo "Request:"

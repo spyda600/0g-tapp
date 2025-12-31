@@ -279,7 +279,7 @@ fn validate_signature(
             "Timestamp outside acceptable window"
         );
         return Err(Status::unauthenticated(
-            "Timestamp outside acceptable window (±5 minutes)",
+            "Timestamp outside acceptable window (±2 minutes)",
         ));
     }
 

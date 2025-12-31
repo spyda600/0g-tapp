@@ -32,6 +32,7 @@ impl MeasurementService {
 
         info!(
             operation = %operation_name,
+            data = ?data,
             "Runtime measurement extended"
         );
 
