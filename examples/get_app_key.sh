@@ -18,7 +18,7 @@ DEFAULT_HOST="localhost"
 DEFAULT_PORT="50051"
 DEFAULT_APP_ID="test-nginx-app"
 DEFAULT_KEY_TYPE="ethereum"
-
+DEFAULT_X25519="true"
 # Parse command line arguments
 TARGET_HOST="$DEFAULT_HOST"
 TARGET_PORT="$DEFAULT_PORT"
@@ -43,6 +43,10 @@ while [[ $# -gt 0 ]]; do
             KEY_TYPE="$2"
             shift 2
             ;;
+        --x25519)
+            X25519="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -51,6 +55,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
             echo "  --app-id APP_ID         Application ID (default: $DEFAULT_APP_ID)"
             echo "  --key-type KEY_TYPE     Key type (default: $DEFAULT_KEY_TYPE)"
+            echo "  --x25519 X25519         X25519 key type (default: true)"
             echo "  --help, -h              Show this help message"
             echo ""
             echo "Examples:"
@@ -91,6 +96,10 @@ fi
 
 if [ -z "$KEY_TYPE" ]; then
     KEY_TYPE="$DEFAULT_KEY_TYPE"
+fi
+
+if [ -z "$X25519" ]; then
+    X25519="$DEFAULT_X25519"
 fi
 
 # Validate app ID
@@ -138,6 +147,7 @@ echo "======================================"
 echo "Target:        $TARGET_ADDRESS"
 echo "App ID:        $APP_ID"
 echo "Key Type:      $KEY_TYPE"
+echo "X25519:        $X25519"
 echo "======================================"
 echo ""
 
@@ -150,7 +160,8 @@ response=$(grpcurl -plaintext \
     -proto tapp_service.proto \
     -d "{
         \"app_id\": \"$APP_ID\",
-        \"key_type\": \"$KEY_TYPE\"
+        \"key_type\": \"$KEY_TYPE\",
+        \"x25519\": \"$X25519\"
     }" \
     "$TARGET_ADDRESS" \
     tapp_service.TappService/GetAppKey 2>&1)
