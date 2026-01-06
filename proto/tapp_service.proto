@@ -29,6 +29,9 @@ service TappService {
   // Get application information
   rpc GetAppInfo(GetAppInfoRequest) returns (GetAppInfoResponse);
 
+  // Get TAPP service configuration
+  rpc GetTappInfo(GetTappInfoRequest) returns (GetTappInfoResponse);
+
   // Get service status and health information
   rpc GetServiceStatus(GetServiceStatusRequest)
       returns (GetServiceStatusResponse);
@@ -237,36 +240,90 @@ message GetAppInfoResponse {
   string volumes_content = 8;
 }
 
-// Service Status Messages
-message GetServiceStatusRequest {
-  string service_name = 1;  // Optional: specific service name to check
+// Get TAPP Info Messages
+message GetTappInfoRequest {
+  // No parameters needed
 }
 
-message ServiceInfo {
-  string name = 1;
-  ServiceHealthStatus status = 2;
-  string status_message = 3;
-  int64 uptime_seconds = 4;
-  int64 memory_usage_mb = 5;
-  double cpu_usage_percent = 6;
-  int32 pid = 7;
-  string version = 8;
+message LoggingConfigInfo {
+  string level = 1;
+  string format = 2;
+  string file_path = 3;  // Empty if logging to stdout
+  int32 max_file_size_mb = 4;
+  int32 max_files = 5;
+}
 
-  // Attestation-related status
-  bool attestation_available = 9;
-  string tee_type = 10;
-  bool kbs_connected = 11;
+message ServerConfigInfo {
+  string bind_address = 1;
+  int32 max_connections = 2;
+  int32 request_timeout_seconds = 3;
+  bool tls_enabled = 4;
+  bool tls_cert_configured =
+      5;  // Whether TLS cert is configured (path not exposed)
+  bool permission_enabled = 6;
+  string owner_address = 7;  // TAPP owner address (if permission enabled)
+}
+
+message BootConfigInfo {
+  string aa_config_path = 1;  // Attestation agent config path
+  string socket_path = 2;     // Docker socket path
+  int32 container_timeout_seconds = 3;
+}
+
+message RetryConfigInfo {
+  int32 max_retries = 1;
+  int32 initial_delay_ms = 2;
+  int32 max_delay_ms = 3;
+}
+
+message KbsConfigInfo {
+  string endpoint = 1;
+  int32 timeout_seconds = 2;
+  bool cert_configured = 3;  // Whether custom CA cert is configured
+  RetryConfigInfo retry = 4;
+  repeated string supported_key_types = 5;
+}
+
+message TappConfigInfo {
+  LoggingConfigInfo logging = 1;
+  ServerConfigInfo server = 2;
+  BootConfigInfo boot = 3;
+  KbsConfigInfo kbs = 4;  // Null if KBS is not configured
+  bool kbs_enabled = 5;
+}
+
+message GetTappInfoResponse {
+  bool success = 1;
+  string message = 2;
+  TappConfigInfo config = 3;
+  string version = 4;  // TAPP service version
+}
+
+// Service Status Messages
+message GetServiceStatusRequest {
+  int32 log_lines =
+      1;  // Number of recent log lines from journalctl (default: 50)
 }
 
 message GetServiceStatusResponse {
   bool success = 1;
   string message = 2;
-  repeated ServiceInfo services = 3;
-  int64 timestamp = 4;
 
-  // Overall system status
-  bool system_healthy = 5;
-  string system_version = 6;
+  // Service information from systemd/journalctl
+  string unit_name = 3;  // systemd unit name (e.g., "tapp-service.service")
+  string active_state =
+      4;                 // active, inactive, failed, activating, deactivating
+  string sub_state = 5;  // running, dead, exited, failed, etc.
+  int64 active_since_timestamp =
+      6;          // When the service became active (unix timestamp)
+  int32 pid = 7;  // Main process PID (0 if not running)
+
+  // Recent logs from journalctl -u <unit> -n <lines>
+  repeated string recent_logs = 8;
+  int32 log_lines_returned = 9;
+
+  int64 timestamp = 10;  // Response timestamp
+  string version = 11;   // TAPP service version
 }
 
 // Service Logs Messages
@@ -274,6 +331,9 @@ message GetServiceLogsRequest {
   string file_name = 1;  // Log file name (if empty, list all available files)
   int32 lines =
       2;  // Number of lines to retrieve (default: 100, tail -n behavior)
+          // If download_full is true, this parameter is ignored
+  bool download_full =
+      3;  // Download complete file content (ignores lines parameter)
 }
 
 message LogFileInfo {
@@ -290,8 +350,10 @@ message GetServiceLogsResponse {
   repeated LogFileInfo available_files = 3;
 
   // If file_name is specified, return file content
-  string content = 4;     // File content (last N lines)
+  string content =
+      4;  // File content (last N lines, or full file if download_full=true)
   int32 total_lines = 5;  // Total lines returned
+  int64 file_size = 6;    // File size in bytes (when download_full=true)
 }
 
 // Application Logs Messages

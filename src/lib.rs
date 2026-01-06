@@ -513,11 +513,234 @@ impl TappService for TappServiceImpl {
         }))
     }
 
+    async fn get_tapp_info(
+        &self,
+        _request: Request<GetTappInfoRequest>,
+    ) -> Result<Response<GetTappInfoResponse>, Status> {
+        info!("Processing GetTappInfo request");
+
+        // Build logging config
+        let logging_config = LoggingConfigInfo {
+            level: self.config.logging.level.clone(),
+            format: self.config.logging.format.clone(),
+            file_path: self
+                .config
+                .logging
+                .file_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            max_file_size_mb: self.config.logging.max_file_size_mb as i32,
+            max_files: self.config.logging.max_files as i32,
+        };
+
+        // Build server config
+        let server_config = ServerConfigInfo {
+            bind_address: self.config.server.bind_address.clone(),
+            max_connections: self.config.server.max_connections as i32,
+            request_timeout_seconds: self.config.server.request_timeout_seconds as i32,
+            tls_enabled: self.config.server.tls_enabled,
+            tls_cert_configured: self.config.server.tls_cert_path.is_some(),
+            permission_enabled: self
+                .config
+                .server
+                .permission
+                .as_ref()
+                .map(|p| p.enabled)
+                .unwrap_or(false),
+            owner_address: self
+                .config
+                .server
+                .permission
+                .as_ref()
+                .map(|p| p.owner_address.clone())
+                .unwrap_or_default(),
+        };
+
+        // Build boot config
+        let boot_config = BootConfigInfo {
+            aa_config_path: self
+                .config
+                .boot
+                .aa_config_path
+                .as_ref()
+                .cloned()
+                .unwrap_or_default(),
+            socket_path: self.config.boot.socket_path.clone(),
+            container_timeout_seconds: self.config.boot.container_timeout_seconds as i32,
+        };
+
+        // Build KBS config if available
+        let kbs_enabled = self.config.kbs.is_some();
+        let kbs_config = self.config.kbs.as_ref().map(|kbs| {
+            let retry_config = RetryConfigInfo {
+                max_retries: kbs.retry.max_retries as i32,
+                initial_delay_ms: kbs.retry.initial_delay_ms as i32,
+                max_delay_ms: kbs.retry.max_delay_ms as i32,
+            };
+
+            KbsConfigInfo {
+                endpoint: kbs.endpoint.clone(),
+                timeout_seconds: kbs.timeout_seconds as i32,
+                cert_configured: kbs.cert_path.is_some(),
+                retry: Some(retry_config),
+                supported_key_types: kbs.supported_key_types.clone(),
+            }
+        });
+
+        // Build complete config info
+        let config_info = TappConfigInfo {
+            logging: Some(logging_config),
+            server: Some(server_config),
+            boot: Some(boot_config),
+            kbs: kbs_config,
+            kbs_enabled,
+        };
+
+        Ok(Response::new(GetTappInfoResponse {
+            success: true,
+            message: "TAPP configuration retrieved successfully".to_string(),
+            config: Some(config_info),
+            version: VERSION.to_string(),
+        }))
+    }
+
     async fn get_service_status(
         &self,
-        _request: Request<GetServiceStatusRequest>,
+        request: Request<GetServiceStatusRequest>,
     ) -> Result<Response<GetServiceStatusResponse>, Status> {
-        todo!()
+        use tokio::process::Command;
+
+        let req = request.into_inner();
+        let log_lines = if req.log_lines > 0 { req.log_lines } else { 50 };
+
+        info!(log_lines = log_lines, "Processing GetServiceStatus request");
+
+        // Determine the systemd unit name
+        // Try to detect from environment or use default
+        let unit_name =
+            std::env::var("SYSTEMD_UNIT").unwrap_or_else(|_| "tapp-server.service".to_string());
+
+        // Get service status using systemctl show
+        let status_output = Command::new("systemctl")
+            .args(&["show", &unit_name, "--no-pager"])
+            .output()
+            .await;
+
+        let (active_state, sub_state, active_since_timestamp, pid) = match status_output {
+            Ok(output) if output.status.success() => {
+                let status_text = String::from_utf8_lossy(&output.stdout);
+                let mut active_state = String::from("unknown");
+                let mut sub_state = String::from("unknown");
+                let mut active_since = 0i64;
+                let mut main_pid = 0i32;
+
+                for line in status_text.lines() {
+                    if let Some((key, value)) = line.split_once('=') {
+                        match key {
+                            "ActiveState" => active_state = value.to_string(),
+                            "SubState" => sub_state = value.to_string(),
+                            "ActiveEnterTimestamp" => {
+                                // Parse timestamp (e.g., "Mon 2024-01-06 10:30:15 UTC")
+                                // For now, we'll try to get the unix timestamp
+                                if let Ok(ts) = value.parse::<i64>() {
+                                    active_since = ts;
+                                }
+                            }
+                            "ActiveEnterTimestampMonotonic" => {
+                                if active_since == 0 {
+                                    if let Ok(ts) = value.parse::<i64>() {
+                                        // Convert monotonic to unix timestamp (approximate)
+                                        active_since = ts / 1_000_000; // microseconds to seconds
+                                    }
+                                }
+                            }
+                            "MainPID" => {
+                                if let Ok(p) = value.parse::<i32>() {
+                                    main_pid = p;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                (active_state, sub_state, active_since, main_pid)
+            }
+            Ok(output) => {
+                let error_text = String::from_utf8_lossy(&output.stderr);
+                info!(
+                    unit_name = %unit_name,
+                    error = %error_text,
+                    "systemctl show command failed"
+                );
+                ("unknown".to_string(), "error".to_string(), 0, 0)
+            }
+            Err(e) => {
+                info!(
+                    unit_name = %unit_name,
+                    error = %e,
+                    "Failed to execute systemctl command"
+                );
+                ("unknown".to_string(), "not-available".to_string(), 0, 0)
+            }
+        };
+
+        // Get recent logs using journalctl
+        let logs_output = Command::new("journalctl")
+            .args(&[
+                "-u",
+                &unit_name,
+                "-n",
+                &log_lines.to_string(),
+                "--no-pager",
+                "--output=short-iso",
+            ])
+            .output()
+            .await;
+
+        let (recent_logs, log_lines_returned) = match logs_output {
+            Ok(output) if output.status.success() => {
+                let logs_text = String::from_utf8_lossy(&output.stdout);
+                let logs: Vec<String> = logs_text.lines().map(|s| s.to_string()).collect();
+                let count = logs.len() as i32;
+                (logs, count)
+            }
+            Ok(output) => {
+                let error_text = String::from_utf8_lossy(&output.stderr);
+                info!(
+                    unit_name = %unit_name,
+                    error = %error_text,
+                    "journalctl command failed"
+                );
+                (
+                    vec![format!("Failed to retrieve logs: {}", error_text.trim())],
+                    0,
+                )
+            }
+            Err(e) => {
+                info!(
+                    unit_name = %unit_name,
+                    error = %e,
+                    "Failed to execute journalctl command"
+                );
+                (vec![format!("journalctl command not available: {}", e)], 0)
+            }
+        };
+
+        Ok(Response::new(GetServiceStatusResponse {
+            success: true,
+            message: format!("Service status for {}", unit_name),
+            unit_name,
+            active_state,
+            sub_state,
+            active_since_timestamp,
+            pid,
+            recent_logs,
+            log_lines_returned,
+            timestamp: crate::utils::current_timestamp(),
+            version: VERSION.to_string(),
+        }))
     }
 
     async fn get_service_logs(

@@ -39,6 +39,7 @@ LINES=""
 PRIVATE_KEY=""
 USE_OWNER=false
 USE_WHITELIST=false
+DOWNLOAD_FULL=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -57,6 +58,10 @@ while [[ $# -gt 0 ]]; do
         --lines)
             LINES="$2"
             shift 2
+            ;;
+        --download-full)
+            DOWNLOAD_FULL=true
+            shift
             ;;
         --private-key)
             PRIVATE_KEY="$2"
@@ -77,7 +82,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --host HOST             gRPC server host (default: $DEFAULT_HOST)"
             echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
             echo "  --file FILE_NAME        Log file name (empty = list all files)"
-            echo "  --lines LINES           Number of log lines to retrieve (default: $DEFAULT_LINES)"
+            echo "  --lines LINES           Number of log lines to retrieve (default: $DEFAULT_LINES, ignored if --download-full)"
+            echo "  --download-full         Download complete log file (ignores --lines)"
             echo "  --private-key KEY       Private key for signing (required unless using presets)"
             echo "  --use-owner             Use pre-configured owner credentials (requires TAPP_OWNER_PRIVATE_KEY env var)"
             echo "  --use-whitelist         Use pre-configured whitelist user credentials (requires TAPP_WHITELIST_PRIVATE_KEY env var)"
@@ -91,6 +97,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 --host 39.97.63.199 --use-owner"
             echo "  $0 --host 39.97.63.199 --file app.log --use-owner"
             echo "  $0 --host 39.97.63.199 --file app.log --lines 200 --use-whitelist"
+            echo "  $0 --host 39.97.63.199 --file app.log --download-full --use-owner"
             echo ""
             echo "Pre-configured users:"
             echo "  Owner: $OWNER_ADDRESS"
@@ -319,9 +326,11 @@ echo ""
 request_json=$(jq -n \
     --arg file_name "$FILE_NAME" \
     --argjson lines "$LINES" \
+    --argjson download_full "$DOWNLOAD_FULL" \
     '{
         file_name: $file_name,
-        lines: $lines
+        lines: $lines,
+        download_full: $download_full
     }')
 
 echo "Request:"

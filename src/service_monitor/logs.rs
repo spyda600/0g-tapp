@@ -1,6 +1,8 @@
 use crate::proto::{GetServiceLogsRequest, GetServiceLogsResponse, LogFileInfo};
 use crate::TappResult;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -23,7 +25,10 @@ impl LogsService {
     }
 
     /// Get service logs: list files or return file content
-    pub async fn get_logs(&self, request: GetServiceLogsRequest) -> TappResult<GetServiceLogsResponse> {
+    pub async fn get_logs(
+        &self,
+        request: GetServiceLogsRequest,
+    ) -> TappResult<GetServiceLogsResponse> {
         let log_dir = match &self.log_dir {
             Some(dir) => dir,
             None => {
@@ -33,6 +38,7 @@ impl LogsService {
                     available_files: vec![],
                     content: String::new(),
                     total_lines: 0,
+                    file_size: 0,
                 });
             }
         };
@@ -46,57 +52,56 @@ impl LogsService {
                 available_files: files,
                 content: String::new(),
                 total_lines: 0,
+                file_size: 0,
             });
         }
 
         // Otherwise, return the specified file's content
         let file_path = log_dir.join(&request.file_name);
-        let lines = if request.lines > 0 { request.lines as usize } else { 100 };
 
-        let content = self.read_log_file(&file_path, lines).await?;
-        let total_lines = content.lines().count() as i32;
+        // Check if user wants to download the full file
+        if request.download_full {
+            let content = self.read_full_log_file(&file_path).await?;
+            let total_lines = content.lines().count() as i32;
+            let file_size = content.len() as i64;
 
-        Ok(GetServiceLogsResponse {
-            success: true,
-            message: format!("Retrieved {} lines from {}", total_lines, request.file_name),
-            available_files: vec![],
-            content,
-            total_lines,
-        })
+            Ok(GetServiceLogsResponse {
+                success: true,
+                message: format!(
+                    "Downloaded complete file {} ({} bytes, {} lines)",
+                    request.file_name, file_size, total_lines
+                ),
+                available_files: vec![],
+                content,
+                total_lines,
+                file_size,
+            })
+        } else {
+            // Read last N lines (tail behavior)
+            let lines = if request.lines > 0 {
+                request.lines as usize
+            } else {
+                100
+            };
+
+            let content = self.read_log_file(&file_path, lines).await?;
+            let total_lines = content.lines().count() as i32;
+
+            Ok(GetServiceLogsResponse {
+                success: true,
+                message: format!("Retrieved {} lines from {}", total_lines, request.file_name),
+                available_files: vec![],
+                content,
+                total_lines,
+                file_size: 0,
+            })
+        }
     }
 
-    /// List all log files in the directory
+    /// List all log files in the directory (recursively)
     async fn list_log_files(&self, dir: &PathBuf) -> TappResult<Vec<LogFileInfo>> {
         let mut files = Vec::new();
-
-        let mut entries = fs::read_dir(dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-
-            // Only include files (not directories)
-            if !path.is_file() {
-                continue;
-            }
-
-            let file_name = entry.file_name().to_string_lossy().to_string();
-
-            // Get file metadata
-            if let Ok(metadata) = entry.metadata().await {
-                let size_bytes = metadata.len() as i64;
-                let modified_time = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-
-                files.push(LogFileInfo {
-                    file_name,
-                    size_bytes,
-                    modified_time,
-                });
-            }
-        }
+        self.list_log_files_recursive(dir, dir, &mut files).await?;
 
         // Sort by modified time (newest first)
         files.sort_by(|a, b| b.modified_time.cmp(&a.modified_time));
@@ -104,13 +109,80 @@ impl LogsService {
         Ok(files)
     }
 
+    /// Recursively list log files (using Box::pin for async recursion)
+    fn list_log_files_recursive<'a>(
+        &'a self,
+        base_dir: &'a PathBuf,
+        current_dir: &'a PathBuf,
+        files: &'a mut Vec<LogFileInfo>,
+    ) -> Pin<Box<dyn Future<Output = TappResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = fs::read_dir(current_dir).await?;
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let metadata = entry.metadata().await?;
+
+                if metadata.is_dir() {
+                    // Recursively explore subdirectories
+                    self.list_log_files_recursive(base_dir, &path, files)
+                        .await?;
+                } else if metadata.is_file() {
+                    // Calculate relative path from base directory
+                    let relative_path = path
+                        .strip_prefix(base_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let size_bytes = metadata.len() as i64;
+                    let modified_time = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+
+                    files.push(LogFileInfo {
+                        file_name: relative_path,
+                        size_bytes,
+                        modified_time,
+                    });
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Read complete log file content
+    async fn read_full_log_file(&self, path: &PathBuf) -> TappResult<String> {
+        if !path.exists() {
+            return Err(crate::TappError::InvalidParameter {
+                field: "file_name".to_string(),
+                reason: format!("Log file not found: {:?}", path),
+            });
+        }
+
+        // Read entire file content
+        let content =
+            fs::read_to_string(path)
+                .await
+                .map_err(|e| crate::TappError::InvalidParameter {
+                    field: "file_name".to_string(),
+                    reason: format!("Failed to read file: {}", e),
+                })?;
+
+        Ok(content)
+    }
+
     /// Read last N lines from a log file (tail -n behavior)
     async fn read_log_file(&self, path: &PathBuf, max_lines: usize) -> TappResult<String> {
         if !path.exists() {
-           return Err(crate::TappError::InvalidParameter {
+            return Err(crate::TappError::InvalidParameter {
                 field: "file_name".to_string(),
-                reason: format!("Log file not found: {:?}", path), 
-           });
+                reason: format!("Log file not found: {:?}", path),
+            });
         }
 
         let file = fs::File::open(path).await?;
@@ -134,4 +206,3 @@ impl LogsService {
         Ok(content)
     }
 }
-
