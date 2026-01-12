@@ -47,6 +47,12 @@ ring = "0.17"
 k256 = { version = "0.13", features = ["ecdsa", "std"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
+# Ethereum transaction support
+ethers = { version = "2.0", default-features = false, features = [
+    "legacy",
+    "rustls",
+] }
+
 # Error handling and logging
 anyhow = "1.0"
 thiserror = "1.0"

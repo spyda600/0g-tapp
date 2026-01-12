@@ -166,8 +166,6 @@ if command -v jq &> /dev/null; then
         "\n  Level:           " + (.config.logging.level // "N/A") +
         "\n  Format:          " + (.config.logging.format // "N/A") +
         "\n  File Path:       " + (.config.logging.filePath // "stdout") +
-        "\n  Max File Size:   " + ((.config.logging.maxFileSizeMb | tostring) // "N/A") + " MB" +
-        "\n  Max Files:       " + ((.config.logging.maxFiles | tostring) // "N/A") +
         "\n\n🌐 Server Configuration:" +
         "\n  Bind Address:    " + (.config.server.bindAddress // "N/A") +
         "\n  Max Connections: " + ((.config.server.maxConnections | tostring) // "N/A") +

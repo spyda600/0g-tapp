@@ -60,6 +60,10 @@ service TappService {
   // List all app ownerships
   rpc ListAllOwnerships(ListAllOwnershipsRequest)
       returns (ListAllOwnershipsResponse);
+
+  // Ethereum Operations
+  // Withdraw all ETH from app address to owner address
+  rpc WithdrawBalance(WithdrawBalanceRequest) returns (WithdrawBalanceResponse);
 }
 
 enum LogLevel {
@@ -249,8 +253,6 @@ message LoggingConfigInfo {
   string level = 1;
   string format = 2;
   string file_path = 3;  // Empty if logging to stdout
-  int32 max_file_size_mb = 4;
-  int32 max_files = 5;
 }
 
 message ServerConfigInfo {
@@ -432,4 +434,27 @@ message ListAllOwnershipsResponse {
   bool success = 1;
   string message = 2;
   repeated AppOwnershipInfo ownerships = 3;  // List of all app ownerships
+}
+
+// Ethereum Withdrawal Messages
+
+message WithdrawBalanceRequest {
+  string app_id = 1;    // Application identifier
+  string rpc_url = 2;   // Ethereum RPC endpoint (e.g.,
+                        // "https://eth-sepolia.g.alchemy.com/v2/...")
+  uint64 chain_id = 3;  // Chain ID (e.g., 1 for mainnet, 11155111 for sepolia)
+  string recipient =
+      4;  // Optional: custom recipient address (defaults to tapp owner)
+}
+
+message WithdrawBalanceResponse {
+  bool success = 1;
+  string message = 2;
+  string transaction_hash = 3;  // Transaction hash on success
+  string from_address = 4;      // App's Ethereum address
+  string to_address = 5;        // Recipient address
+  string amount = 6;  // Amount transferred in Wei (as string to avoid overflow)
+  uint64 gas_used = 7;   // Estimated gas used
+  uint64 gas_price = 8;  // Gas price used (in Wei)
+  int64 timestamp = 9;   // Operation timestamp
 }

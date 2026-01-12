@@ -38,14 +38,6 @@ pub struct LoggingConfig {
 
     /// Log file path (if None, logs to stdout)
     pub file_path: Option<PathBuf>,
-
-    /// Maximum log file size in MB
-    #[serde(default = "default_max_log_size")]
-    pub max_file_size_mb: u64,
-
-    /// Maximum number of log files to keep
-    #[serde(default = "default_max_log_files")]
-    pub max_files: usize,
 }
 
 /// Main configuration structure for TAPP service
@@ -211,14 +203,6 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
-fn default_max_log_size() -> u64 {
-    100
-}
-
-fn default_max_log_files() -> usize {
-    10
-}
-
 fn default_kbs_endpoint() -> String {
     "http://localhost:8080".to_string()
 }
@@ -275,8 +259,6 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             format: default_log_format(),
             file_path: None,
-            max_file_size_mb: default_max_log_size(),
-            max_files: default_max_log_files(),
         }
     }
 }

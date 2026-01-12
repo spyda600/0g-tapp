@@ -1,5 +1,6 @@
 pub mod app_key;
 pub mod auth_layer;
+pub mod balance_withdrawal;
 pub mod boot;
 pub mod config;
 pub mod error;
@@ -530,8 +531,6 @@ impl TappService for TappServiceImpl {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            max_file_size_mb: self.config.logging.max_file_size_mb as i32,
-            max_files: self.config.logging.max_files as i32,
         };
 
         // Build server config
@@ -962,6 +961,87 @@ impl TappService for TappServiceImpl {
             success: true,
             message: format!("Found {} app ownership(s)", ownerships.len()),
             ownerships,
+        }))
+    }
+
+    async fn withdraw_balance(
+        &self,
+        request: Request<WithdrawBalanceRequest>,
+    ) -> Result<Response<WithdrawBalanceResponse>, Status> {
+        let signer = auth_layer::get_signer_address(&request);
+
+        let req = request.into_inner();
+        let app_id = &req.app_id;
+
+        // Get app private key
+        let private_key = self
+            .app_key_service
+            .get_private_key(app_id)
+            .await
+            .map_err(|e| Status::not_found(format!("App key not found: {}", e)))?;
+
+        // Determine recipient
+        let recipient = if req.recipient.is_empty() {
+            self.permission_manager
+                .as_ref()
+                .map(|pm| pm.get_tapp_owner_address().to_string())
+                .ok_or_else(|| Status::internal("TAPP owner not configured"))?
+        } else {
+            req.recipient.clone()
+        };
+
+        // Execute withdrawal
+        let result = balance_withdrawal::withdraw_balance(
+            &private_key,
+            &req.rpc_url,
+            req.chain_id,
+            &recipient,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("Withdrawal failed: {}", e)))?;
+
+        // Record measurement
+        let measurement = serde_json::json!({
+            "operation": "withdraw_balance",
+            "app_id": app_id,
+            "from_address": result.from_address,
+            "to_address": result.to_address,
+            "amount": result.amount,
+            "transaction_hash": result.transaction_hash,
+            "chain_id": req.chain_id,
+            "signer": signer,
+            "timestamp": chrono::Utc::now().timestamp(),
+        });
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_WITHDRAW_BALANCE,
+                &measurement.to_string(),
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, "Failed to record withdrawal measurement");
+        }
+
+        tracing::info!(
+            app_id = %app_id,
+            tx_hash = %result.transaction_hash,
+            amount = %result.amount,
+            event = "WITHDRAW_BALANCE_SUCCESS",
+            "Balance withdrawal successful"
+        );
+
+        Ok(Response::new(WithdrawBalanceResponse {
+            success: true,
+            message: "Withdrawal successful".to_string(),
+            transaction_hash: result.transaction_hash,
+            from_address: result.from_address,
+            to_address: result.to_address,
+            amount: result.amount,
+            gas_used: result.gas_used,
+            gas_price: result.gas_price.parse().unwrap_or(0),
+            timestamp: chrono::Utc::now().timestamp(),
         }))
     }
 }

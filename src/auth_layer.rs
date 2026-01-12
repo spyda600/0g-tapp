@@ -215,7 +215,9 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "ListAllOwnerships" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
-        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" => MethodPermission::Whitelist,
+        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" => {
+            MethodPermission::Whitelist
+        }
 
         // Default: require owner permission
         _ => {
