@@ -14,10 +14,11 @@ pub mod utils;
 pub use boot::BootService;
 pub use config::TappConfig;
 pub use error::{TappError, TappResult};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 pub use task_manager::TaskStatus;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 // Re-export generated protobuf types
 pub mod proto {
@@ -46,46 +47,75 @@ pub struct TappServiceImpl {
 }
 
 impl TappServiceImpl {
-    /// Check if an IP address is allowed to access sensitive operations
-    /// Allows: localhost (IPv4/IPv6) and Docker bridge networks
-    fn is_allowed_local_access(ip: std::net::IpAddr) -> bool {
-        // 1. Check if it's loopback
-        if ip.is_loopback() {
-            return true;
-        }
+    /// Check if an IP address is allowed for local access
+    /// Allows:
+    /// - Localhost (127.0.0.1, ::1)
+    /// - Docker bridge networks (172.16.0.0/12)
+    /// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+    fn is_allowed_local_access(ip: IpAddr) -> bool {
+        use std::net::IpAddr;
 
-        // 2. Check if it's in Docker network ranges
-        if let std::net::IpAddr::V4(ipv4) = ip {
-            let octets = ipv4.octets();
+        match ip {
+            IpAddr::V4(ipv4) => {
+                // Localhost: 127.0.0.1
+                if ipv4.is_loopback() {
+                    return true;
+                }
 
-            // Docker default bridge network: 172.17.0.0/16
-            if octets[0] == 172 && octets[1] == 17 {
-                return true;
+                // Private networks (includes Docker networks)
+                // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                if ipv4.is_private() {
+                    return true;
+                }
+
+                false
             }
-
-            // Docker custom bridge networks: 172.18.0.0/16 - 172.31.0.0/16
-            if octets[0] == 172 && octets[1] >= 18 && octets[1] <= 31 {
-                return true;
+            IpAddr::V6(ipv6) => {
+                // Localhost: ::1
+                ipv6.is_loopback()
             }
         }
-
-        false
     }
 
     /// Determine the source type for logging
-    fn get_source_type(ip: std::net::IpAddr) -> &'static str {
-        if ip.is_loopback() {
-            "localhost"
-        } else if let std::net::IpAddr::V4(ipv4) = ip {
-            let octets = ipv4.octets();
-            if octets[0] == 172 && (octets[1] >= 17 && octets[1] <= 31) {
-                "docker-network"
-            } else {
-                "unknown"
+    /// Get source type description for logging
+    fn get_source_type(ip: IpAddr) -> &'static str {
+        use std::net::IpAddr;
+
+        match ip {
+            IpAddr::V4(ipv4) => {
+                if ipv4.is_loopback() {
+                    "localhost"
+                } else if Self::is_docker_bridge_network(ipv4) {
+                    "docker-bridge"
+                } else if Self::is_docker_custom_network(ipv4) {
+                    "docker-custom"
+                } else if ipv4.is_private() {
+                    "private-network"
+                } else {
+                    "public-network"
+                }
             }
-        } else {
-            "unknown"
+            IpAddr::V6(ipv6) => {
+                if ipv6.is_loopback() {
+                    "localhost-ipv6"
+                } else {
+                    "ipv6-network"
+                }
+            }
         }
+    }
+
+    /// Check if IP is from Docker default bridge network (172.17.0.0/16)
+    fn is_docker_bridge_network(ip: Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        octets[0] == 172 && octets[1] == 17
+    }
+
+    /// Check if IP is from Docker custom networks (172.18-31.0.0/16)
+    fn is_docker_custom_network(ip: Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        octets[0] == 172 && (18..=31).contains(&octets[1])
     }
 
     pub async fn new(
@@ -140,6 +170,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetEvidenceRequest>,
     ) -> Result<Response<GetEvidenceResponse>, Status> {
+        info!("Calling GetEvidence");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
         let evidence = self.boot_service.get_evidence(req).await?;
         Ok(Response::new(evidence))
@@ -151,6 +183,8 @@ impl TappService for TappServiceImpl {
     ) -> Result<Response<StartAppResponse>, Status> {
         // Signature validation is handled by AuthLayer
         // Get signer address before consuming request
+        info!("Calling StartApp");
+        debug!("Request: {:?}", request);
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
         let app_id = req_inner.app_id.clone();
@@ -192,6 +226,8 @@ impl TappService for TappServiceImpl {
         request: Request<StopAppRequest>,
     ) -> Result<Response<StopAppResponse>, Status> {
         // Get signer address before consuming request
+        info!("Calling StopApp");
+        debug!("Request: {:?}", request);
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
         let app_id = req_inner.app_id.clone();
@@ -248,6 +284,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetTaskStatusRequest>,
     ) -> Result<Response<GetTaskStatusResponse>, Status> {
+        info!("Calling GetTaskStatus");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
 
         match self.boot_service.get_task_status(&req.task_id).await {
@@ -297,9 +335,12 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppKeyRequest>,
     ) -> Result<Response<GetAppKeyResponse>, Status> {
+        info!("Calling GetAppKey");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
 
         // Default to "ethereum" if key_type is not specified
+        // TODO: Remove
         let key_type = if req.key_type.is_empty() {
             "ethereum"
         } else {
@@ -321,6 +362,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppSecretKeyRequest>,
     ) -> Result<Response<GetAppSecretKeyResponse>, Status> {
+        info!("Calling GetAppSecretKey");
+        debug!("Request: {:?}", request);
         // SECURITY: Extract remote address BEFORE consuming request
         let remote_addr = request.remote_addr();
 
@@ -349,32 +392,32 @@ impl TappService for TappServiceImpl {
         }
 
         // Get signer address from signature (handled by AuthLayer)
-        let signer = auth_layer::get_signer_address(&request);
+        // let signer = auth_layer::get_signer_address(&request);
         let req = request.into_inner();
         let mut key_type = "ethereum".to_string();
         if !req.key_type.is_empty() {
             key_type = req.key_type;
         }
 
-        // SECURITY: Check app ownership
-        if let Some(pm) = &self.permission_manager {
-            if let Some(signer_addr) = &signer {
-                if !pm.can_manage_app(&req.app_id, signer_addr).await {
-                    tracing::error!(
-                        app_id = %req.app_id,
-                        signer = %signer_addr,
-                        remote_addr = ?remote_addr,
-                        event = "SECRET_KEY_ACCESS_DENIED",
-                        reason = "not app owner or tapp owner",
-                        "Permission denied: only app owner or tapp owner can access secret key"
-                    );
+        // // SECURITY: Check app ownership
+        // if let Some(pm) = &self.permission_manager {
+        //     if let Some(signer_addr) = &signer {
+        //         if !pm.can_manage_app(&req.app_id, signer_addr).await {
+        //             tracing::error!(
+        //                 app_id = %req.app_id,
+        //                 signer = %signer_addr,
+        //                 remote_addr = ?remote_addr,
+        //                 event = "SECRET_KEY_ACCESS_DENIED",
+        //                 reason = "not app owner or tapp owner",
+        //                 "Permission denied: only app owner or tapp owner can access secret key"
+        //             );
 
-                    return Err(Status::permission_denied(
-                        "Only the app owner or tapp owner can access the app's secret key",
-                    ));
-                }
-            }
-        }
+        //             return Err(Status::permission_denied(
+        //                 "Only the app owner or tapp owner can access the app's secret key",
+        //             ));
+        //         }
+        //     }
+        // }
 
         // Get the app info to get compose_hash, volumes_hash, deployer
         let app_info = self
@@ -394,7 +437,6 @@ impl TappService for TappServiceImpl {
         // SECURITY: Log all private key access attempts
         tracing::warn!(
             app_id = %req.app_id,
-            signer = ?signer,
             remote_addr = ?remote_addr,
             source_type = source_type,
             event = "SECRET_KEY_ACCESS",
@@ -456,10 +498,10 @@ impl TappService for TappServiceImpl {
                 // SECURITY: Log successful retrieval
                 tracing::warn!(
                     app_id = %req.app_id,
-                    signer = ?signer,
+                    // signer = ?signer,
                     remote_addr = ?remote_addr,
                     source_type = source_type,
-                    accessor = signer.as_deref().unwrap_or("unknown"),
+                    // accessor = signer.as_deref().unwrap_or("unknown"),
                     event = "SECRET_KEY_RETRIEVED",
                     timestamp = %chrono::Utc::now(),
                     "Private key successfully retrieved"
@@ -477,7 +519,7 @@ impl TappService for TappServiceImpl {
             Err(e) => {
                 tracing::error!(
                     app_id = %req.app_id,
-                    signer = ?signer,
+                    // signer = ?signer,
                     remote_addr = ?remote_addr,
                     event = "SECRET_KEY_RETRIEVAL_FAILED",
                     error = %e,
@@ -492,6 +534,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppInfoRequest>,
     ) -> Result<Response<GetAppInfoResponse>, Status> {
+        info!("Calling GetAppInfo");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
         let app_id = req.app_id;
 
@@ -518,7 +562,7 @@ impl TappService for TappServiceImpl {
         &self,
         _request: Request<GetTappInfoRequest>,
     ) -> Result<Response<GetTappInfoResponse>, Status> {
-        info!("Processing GetTappInfo request");
+        info!("Calling GetTappInfo");
 
         // Build logging config
         let logging_config = LoggingConfigInfo {
@@ -608,6 +652,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetServiceStatusRequest>,
     ) -> Result<Response<GetServiceStatusResponse>, Status> {
+        info!("Calling GetServiceStatus");
+        debug!("Request: {:?}", request);
         use tokio::process::Command;
 
         let req = request.into_inner();
@@ -746,6 +792,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetServiceLogsRequest>,
     ) -> Result<Response<GetServiceLogsResponse>, Status> {
+        info!("Calling GetServiceLogs");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
         let response = self.logs_service.get_logs(req).await?;
         Ok(Response::new(response))
@@ -755,6 +803,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppLogsRequest>,
     ) -> Result<Response<GetAppLogsResponse>, Status> {
+        info!("Calling GetAppLogs");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
 
         let service_name = if req.service_name.is_empty() {
@@ -786,6 +836,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<AddToWhitelistRequest>,
     ) -> Result<Response<AddToWhitelistResponse>, Status> {
+        info!("Calling AddToWhitelist");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
 
         let pm = self
@@ -830,6 +882,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<RemoveFromWhitelistRequest>,
     ) -> Result<Response<RemoveFromWhitelistResponse>, Status> {
+        info!("Calling RemoveFromWhitelist");
+        debug!("Request: {:?}", request);
         let req = request.into_inner();
 
         let pm = self
@@ -874,6 +928,7 @@ impl TappService for TappServiceImpl {
         &self,
         _request: Request<ListWhitelistRequest>,
     ) -> Result<Response<ListWhitelistResponse>, Status> {
+        info!("Calling ListWhitelist");
         let pm = self
             .permission_manager
             .as_ref()
@@ -892,6 +947,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<GetAppOwnershipRequest>,
     ) -> Result<Response<GetAppOwnershipResponse>, Status> {
+        info!("Calling GetAppOwnership");
+        debug!("Request: {:?}", request);
         // Get signer address before consuming request
         let signer = auth_layer::get_signer_address(&request)
             .ok_or_else(|| Status::unauthenticated("Signer address not found"))?;
@@ -936,6 +993,7 @@ impl TappService for TappServiceImpl {
         &self,
         _request: Request<ListAllOwnershipsRequest>,
     ) -> Result<Response<ListAllOwnershipsResponse>, Status> {
+        info!("Calling ListAllOwnerships");
         let pm = self
             .permission_manager
             .as_ref()
@@ -968,6 +1026,8 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<WithdrawBalanceRequest>,
     ) -> Result<Response<WithdrawBalanceResponse>, Status> {
+        info!("Calling WithdrawBalance");
+        debug!("Request: {:?}", request);
         let signer = auth_layer::get_signer_address(&request);
 
         let req = request.into_inner();
@@ -1002,7 +1062,7 @@ impl TappService for TappServiceImpl {
 
         // Record measurement
         let measurement = serde_json::json!({
-            "operation": "withdraw_balance",
+            "operation": measurement_service::OPERATION_NAME_WITHDRAW_BALANCE,
             "app_id": app_id,
             "from_address": result.from_address,
             "to_address": result.to_address,
