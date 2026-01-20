@@ -616,6 +616,55 @@ enable_eventlog = true
 
         Ok(())
     }
+
+    /// Docker logout from registry
+    pub async fn docker_logout(&self, registry: &str) -> TappResult<()> {
+        use tokio::process::Command;
+
+        info!(registry = %registry, "Executing docker logout");
+
+        // Determine registry (default to Docker Hub if empty)
+        let registry_arg = if registry.is_empty() {
+            "docker.io"
+        } else {
+            registry
+        };
+
+        // Execute docker logout command
+        let output = Command::new("docker")
+            .args(&["logout", registry_arg])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| DockerError::CommandFailed {
+                command: "docker logout".to_string(),
+                reason: format!("Failed to execute: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                registry = %registry_arg,
+                stderr = %stderr,
+                "Docker logout failed"
+            );
+            return Err(DockerError::CommandFailed {
+                command: "docker logout".to_string(),
+                reason: format!("Logout failed: {}", stderr),
+            }
+            .into());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        info!(
+            registry = %registry_arg,
+            output = %stdout.trim(),
+            "Docker logout successful"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

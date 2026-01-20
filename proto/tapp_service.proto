@@ -68,6 +68,9 @@ service TappService {
   // Docker Operations
   // Login to Docker registry to pull private images
   rpc DockerLogin(DockerLoginRequest) returns (DockerLoginResponse);
+
+  // Logout from Docker registry
+  rpc DockerLogout(DockerLogoutRequest) returns (DockerLogoutResponse);
 }
 
 enum LogLevel {
@@ -478,4 +481,18 @@ message DockerLoginResponse {
   string registry = 3;  // Registry that was logged into
   string username = 4;  // Username used for login
   int64 timestamp = 5;  // Operation timestamp
+}
+
+// Docker Logout Messages
+message DockerLogoutRequest {
+  string registry = 1;  // Docker registry URL (e.g.,
+                        // "eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com")
+                        // If empty, defaults to Docker Hub (docker.io)
+}
+
+message DockerLogoutResponse {
+  bool success = 1;
+  string message = 2;
+  string registry = 3;  // Registry that was logged out from
+  int64 timestamp = 4;  // Operation timestamp
 }

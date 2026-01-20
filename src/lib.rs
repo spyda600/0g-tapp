@@ -1164,6 +1164,60 @@ impl TappService for TappServiceImpl {
             timestamp: chrono::Utc::now().timestamp(),
         }))
     }
+
+    async fn docker_logout(
+        &self,
+        request: Request<DockerLogoutRequest>,
+    ) -> Result<Response<DockerLogoutResponse>, Status> {
+        info!("Processing DockerLogout request");
+        let signer = auth_layer::get_signer_address(&request);
+
+        let req = request.into_inner();
+        let registry = req.registry.clone();
+
+        // Execute docker logout
+        self.boot_service.docker_logout(&registry).await?;
+
+        // Determine actual registry for response
+        let actual_registry = if registry.is_empty() {
+            "docker.io".to_string()
+        } else {
+            registry
+        };
+
+        // Record measurement
+        let measurement = serde_json::json!({
+            "operation": measurement_service::OPERATION_NAME_DOCKER_LOGOUT,
+            "registry": actual_registry.clone(),
+            "signer": signer.clone(),
+            "timestamp": chrono::Utc::now().timestamp(),
+        });
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_DOCKER_LOGOUT,
+                &measurement.to_string(),
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, "Failed to record docker logout measurement");
+        }
+
+        tracing::info!(
+            registry = %actual_registry,
+            signer = %signer.unwrap_or_default(),
+            event = "DOCKER_LOGOUT_SUCCESS",
+            "Docker logout successful"
+        );
+
+        Ok(Response::new(DockerLogoutResponse {
+            success: true,
+            message: format!("Successfully logged out from {}", actual_registry),
+            registry: actual_registry,
+            timestamp: chrono::Utc::now().timestamp(),
+        }))
+    }
 }
 
 /// Initialize tracing based on configuration
