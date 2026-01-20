@@ -60,14 +60,20 @@ pub async fn withdraw_balance(
     // Calculate transfer amount
     let amount = balance - gas_cost;
 
-    // Build transaction
+    let nonce = provider
+        .get_transaction_count(from_address, None)
+        .await
+        .map_err(|e| anyhow!("Failed to get nonce: {}", e))?;
+
+    // Build transaction with nonce
     let tx = TransactionRequest::new()
         .from(from_address)
         .to(to_address)
         .value(amount)
         .gas(gas_limit)
         .gas_price(gas_price)
-        .chain_id(chain_id);
+        .chain_id(chain_id)
+        .nonce(nonce);
 
     // Sign transaction
     let signature = wallet

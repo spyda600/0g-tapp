@@ -1104,6 +1104,66 @@ impl TappService for TappServiceImpl {
             timestamp: chrono::Utc::now().timestamp(),
         }))
     }
+
+    async fn docker_login(
+        &self,
+        request: Request<DockerLoginRequest>,
+    ) -> Result<Response<DockerLoginResponse>, Status> {
+        info!("Processing DockerLogin request");
+        let signer = auth_layer::get_signer_address(&request);
+
+        let req = request.into_inner();
+        let registry = req.registry.clone();
+        let username = req.username.clone();
+
+        // Execute docker login
+        self.boot_service
+            .docker_login(&registry, &username, &req.password)
+            .await?;
+
+        // Determine actual registry for response
+        let actual_registry = if registry.is_empty() {
+            "docker.io".to_string()
+        } else {
+            registry
+        };
+
+        // Record measurement
+        let measurement = serde_json::json!({
+            "operation": measurement_service::OPERATION_NAME_DOCKER_LOGIN,
+            "registry": actual_registry.clone(),
+            "username": username.clone(),
+            "signer": signer.clone(),
+            "timestamp": chrono::Utc::now().timestamp(),
+        });
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_DOCKER_LOGIN,
+                &measurement.to_string(),
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, "Failed to record docker login measurement");
+        }
+
+        tracing::info!(
+            registry = %actual_registry,
+            username = %username,
+            signer = %signer.unwrap_or_default(),
+            event = "DOCKER_LOGIN_SUCCESS",
+            "Docker login successful"
+        );
+
+        Ok(Response::new(DockerLoginResponse {
+            success: true,
+            message: format!("Successfully logged into {}", actual_registry),
+            registry: actual_registry,
+            username,
+            timestamp: chrono::Utc::now().timestamp(),
+        }))
+    }
 }
 
 /// Initialize tracing based on configuration

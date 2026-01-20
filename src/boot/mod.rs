@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Clone)]
 pub struct AppComposeContent {
@@ -529,6 +529,92 @@ enable_eventlog = true
     pub async fn get_app_info(&self, app_id: &str) -> TappResult<Option<AppInfo>> {
         let app_info = self.app_info.lock().await;
         Ok(app_info.get(app_id).cloned())
+    }
+
+    /// Docker login to registry for pulling private images
+    pub async fn docker_login(
+        &self,
+        registry: &str,
+        username: &str,
+        password: &str,
+    ) -> TappResult<()> {
+        use tokio::io::AsyncWriteExt;
+        use tokio::process::Command;
+
+        info!(
+            registry = %registry,
+            username = %username,
+            "Executing docker login"
+        );
+
+        // Determine registry (default to Docker Hub if empty)
+        let registry_arg = if registry.is_empty() {
+            "docker.io"
+        } else {
+            registry
+        };
+
+        // Execute docker login command with password via stdin
+        let mut child = Command::new("docker")
+            .args(&[
+                "login",
+                registry_arg,
+                "--username",
+                username,
+                "--password-stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| DockerError::CommandFailed {
+                command: "docker login".to_string(),
+                reason: format!("Failed to spawn command: {}", e),
+            })?;
+
+        // Write password to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(password.as_bytes())
+                .await
+                .map_err(|e| DockerError::CommandFailed {
+                    command: "docker login".to_string(),
+                    reason: format!("Failed to write password: {}", e),
+                })?;
+            stdin.shutdown().await.ok();
+        }
+
+        // Wait for command to complete
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| DockerError::CommandFailed {
+                command: "docker login".to_string(),
+                reason: format!("Failed to wait for command: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                registry = %registry_arg,
+                stderr = %stderr,
+                "Docker login failed"
+            );
+            return Err(DockerError::CommandFailed {
+                command: "docker login".to_string(),
+                reason: format!("Login failed: {}", stderr),
+            }
+            .into());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        info!(
+            registry = %registry_arg,
+            output = %stdout.trim(),
+            "Docker login successful"
+        );
+
+        Ok(())
     }
 }
 

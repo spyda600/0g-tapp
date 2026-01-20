@@ -109,6 +109,9 @@ pub enum DockerError {
 
     #[error("Service not found: {service_name}")]
     ServiceNotFound { service_name: String },
+
+    #[error("Command failed: {command} - {reason}")]
+    CommandFailed { command: String, reason: String },
 }
 
 /// Configuration specific errors

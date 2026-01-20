@@ -13,6 +13,7 @@ pub const OPERATION_NAME_GET_APP_SECRET_KEY: &str = "get_app_secret_key";
 pub const OPERATION_NAME_ADD_TO_WHITELIST: &str = "add_to_whitelist";
 pub const OPERATION_NAME_REMOVE_FROM_WHITELIST: &str = "remove_from_whitelist";
 pub const OPERATION_NAME_WITHDRAW_BALANCE: &str = "withdraw_balance";
+pub const OPERATION_NAME_DOCKER_LOGIN: &str = "docker_login";
 
 pub struct MeasurementService {
     aa: Arc<Mutex<AttestationAgent>>,

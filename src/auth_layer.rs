@@ -215,10 +215,10 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "ListAllOwnerships" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
-        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" => {
+        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" | "DockerLogin" => {
             MethodPermission::Whitelist
         }
-
+        
         // Default: require owner permission
         _ => {
             warn!(method = %method_name, "Unknown method, defaulting to OwnerOnly");

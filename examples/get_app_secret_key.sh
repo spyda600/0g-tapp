@@ -58,18 +58,6 @@ while [[ $# -gt 0 ]]; do
             APP_ID="$2"
             shift 2
             ;;
-        --private-key)
-            PRIVATE_KEY="$2"
-            shift 2
-            ;;
-        --use-owner)
-            USE_OWNER=true
-            shift
-            ;;
-        --use-whitelist)
-            USE_WHITELIST=true
-            shift
-            ;;
         --x25519)
             X25519=true
             shift
@@ -81,29 +69,17 @@ while [[ $# -gt 0 ]]; do
             echo "  --host HOST             gRPC server host (default: $DEFAULT_HOST)"
             echo "  --port PORT             gRPC server port (default: $DEFAULT_PORT)"
             echo "  --app-id APP_ID         Application ID (required)"
-            echo "  --private-key KEY       Private key for signing (required unless using presets)"
-            echo "  --use-owner             Use pre-configured owner credentials (requires TAPP_OWNER_PRIVATE_KEY env var)"
-            echo "  --use-whitelist         Use pre-configured whitelist user credentials (requires TAPP_WHITELIST_PRIVATE_KEY env var)"
             echo "  --x25519                Use X25519 key pair (default: $DEFAULT_X25519)"
             echo "  --help, -h              Show this help message"
             echo ""
-            echo "Environment variables:"
-            echo "  TAPP_OWNER_PRIVATE_KEY       Private key for owner account"
-            echo "  TAPP_WHITELIST_PRIVATE_KEY   Private key for whitelist account"
-            echo ""
             echo "Examples:"
-            echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --use-owner"
-            echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --use-whitelist"
-            echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --use-whitelist --x25519"
+            echo "  $0 --host 39.97.63.199 --app-id test-nginx-app"
+            echo "  $0 --host 39.97.63.199 --app-id test-nginx-app --x25519"
             echo ""
             echo "⚠️  SECURITY WARNING:"
             echo "  This command retrieves the APPLICATION'S PRIVATE KEY."
-            echo "  Only the app deployer (owner) can retrieve the secret key."
             echo "  Handle the returned private key with extreme care!"
             echo ""
-            echo "Pre-configured users:"
-            echo "  Owner: $OWNER_ADDRESS"
-            echo "  Whitelist: $WHITELIST_ADDRESS"
             exit 0
             ;;
         *)
@@ -113,35 +89,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# Determine which credentials to use
-if [ "$USE_OWNER" = true ]; then
-    if [ -z "$OWNER_PRIVATE_KEY" ]; then
-        echo "Error: Owner private key not found"
-        echo "Please set the TAPP_OWNER_PRIVATE_KEY environment variable:"
-        echo "  export TAPP_OWNER_PRIVATE_KEY=\"0x...\""
-        exit 1
-    fi
-    PRIVATE_KEY="$OWNER_PRIVATE_KEY"
-    echo "Using owner credentials: $OWNER_ADDRESS"
-elif [ "$USE_WHITELIST" = true ]; then
-    if [ -z "$WHITELIST_PRIVATE_KEY" ]; then
-        echo "Error: Whitelist private key not found"
-        echo "Please set the TAPP_WHITELIST_PRIVATE_KEY environment variable:"
-        echo "  export TAPP_WHITELIST_PRIVATE_KEY=\"0x...\""
-        exit 1
-    fi
-    PRIVATE_KEY="$WHITELIST_PRIVATE_KEY"
-    echo "Using whitelist user credentials: $WHITELIST_ADDRESS"
-elif [ -z "$PRIVATE_KEY" ]; then
-    echo "Error: Private key is required"
-    echo ""
-    echo "Options:"
-    echo "  1. Use --private-key KEY"
-    echo "  2. Use --use-owner with TAPP_OWNER_PRIVATE_KEY env var"
-    echo "  3. Use --use-whitelist with TAPP_WHITELIST_PRIVATE_KEY env var"
-    exit 1
-fi
 
 TARGET_ADDRESS="$TARGET_HOST:$TARGET_PORT"
 
@@ -288,24 +235,6 @@ echo "Only the app deployer should have access to this key."
 echo "======================================"
 echo ""
 
-# Generate signature
-echo "Generating signature..."
-SIGN_OUTPUT=$(python3 "$sign_script" "GetAppSecretKey" "$PRIVATE_KEY" 2>&1)
-if [ $? -ne 0 ]; then
-    echo "Error generating signature: $SIGN_OUTPUT"
-    exit 1
-fi
-
-SIGNATURE=$(echo "$SIGN_OUTPUT" | cut -d',' -f1)
-TIMESTAMP=$(echo "$SIGN_OUTPUT" | cut -d',' -f2)
-SIGNER_ADDRESS=$(echo "$SIGN_OUTPUT" | cut -d',' -f3)
-
-echo "Signer: $SIGNER_ADDRESS"
-echo "Signature: ${SIGNATURE:0:20}...${SIGNATURE: -20}"
-echo "Timestamp: $TIMESTAMP"
-echo "======================================"
-echo ""
-
 # Create request JSON
 request_json=$(jq -n \
     --arg app_id "$APP_ID" \
@@ -342,4 +271,3 @@ echo "Response:"
 echo "--------------------------------------"
 echo "$response"
 echo "--------------------------------------"
-echo ""
