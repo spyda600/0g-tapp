@@ -248,7 +248,7 @@ message GetAppInfoResponse {
   string compose_hash = 5;
   string volumes_hash = 6;
   string compose_content = 7;
-  string volumes_content = 8;
+  // string volumes_content = 8;
 }
 
 // Get TAPP Info Messages

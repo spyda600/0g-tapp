@@ -554,7 +554,7 @@ impl TappService for TappServiceImpl {
             compose_hash: app_info.compose_content.hash,
             volumes_hash: app_info.mount_files.hash,
             compose_content: app_info.compose_content.content,
-            volumes_content: app_info.mount_files.content,
+            // volumes_content: app_info.mount_files.content,
         }))
     }
 
