@@ -83,8 +83,6 @@ export TAPP_OWNER_PRIVATE_KEY="0x..."
 3. Returns a task ID for tracking deployment progress
 4. The application deployment is cryptographically measured and extended to TEE runtime measurements
 
-**Note:** RootFS space is limited, store data in the `/data` directory.
-
 #### Stopping an Application
 
 Stop and remove a deployed application:
@@ -128,6 +126,7 @@ This means that once an application is deployed and measured:
 4. Remote attestation allows third parties to verify application integrity
 
 This security model is ideal for scenarios requiring maximum trust minimization, such as:
+- Trustless automated executor account
 - Multi-party computation platforms
 - Decentralized oracle networks
 - Privacy-preserving data processing
@@ -149,8 +148,8 @@ All applications run within TEE boundaries and are cryptographically measured. T
 
 All measurements include:
 - Operation type (start_app, stop_app, etc.)
-- Application configuration hashes (Docker Compose, mount files)
-- Deployer identity (EVM address)
+- Application configuration hashes (Docker Compose, mount files, image hash)
+- Owner identity (EVM address)
 - Execution result (success/failed) and error details
 - Timestamp
 
@@ -186,6 +185,8 @@ The key principle is: **Measure what the TEE cannot judge, but must record for a
 - ✅ User deploys a malicious container that runs successfully → **Measured as success** (TEE cannot judge intent, only record what happened)
 
 This design ensures that TEE measurements provide a complete, tamper-proof record of all operations that actually executed within the trusted environment, while avoiding unnecessary overhead from policy enforcement actions.
+
+For more details, see the [Tapp documentation](https://0g-labs.notion.site/0G-Tapp-2bed6515e143809dbf54df5477fd3db4).
 
 ## Building from Source
 
