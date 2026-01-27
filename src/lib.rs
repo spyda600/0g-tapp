@@ -99,7 +99,8 @@ impl TappServiceImpl {
         let nonce_manager = nonce_manager::NonceManager::new();
 
         // Initialize LogsService
-        let logs_service = service_monitor::logs::LogsService::new(config.logging.file_path.clone());
+        let logs_service =
+            service_monitor::logs::LogsService::new(config.logging.file_path.clone());
 
         info!("All TAPP service components initialized successfully");
 
@@ -399,13 +400,8 @@ impl TappService for TappServiceImpl {
         let app_id = req.app_id;
 
         let compose_content = self.boot_service.get_app_compose_content(&app_id).await?;
-        let volumes_content = self.boot_service.get_app_mount_files(&app_id).await?;
 
         let compose_content = compose_content.ok_or(TappError::InvalidParameter {
-            field: "app_id".to_string(),
-            reason: format!("App {} not found", app_id),
-        })?;
-        let volumes_content = volumes_content.ok_or(TappError::InvalidParameter {
             field: "app_id".to_string(),
             reason: format!("App {} not found", app_id),
         })?;
@@ -415,7 +411,6 @@ impl TappService for TappServiceImpl {
             message: format!("App info for {}", app_id),
             app_id,
             compose_content,
-            volumes_content,
         }))
     }
 
@@ -599,4 +594,3 @@ mod tests {
         assert_eq!(&padded[5..], &[0u8; 5]);
     }
 }
-

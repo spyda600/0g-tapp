@@ -208,8 +208,7 @@ message GetAppInfoResponse {
   string message = 2;
 
   string app_id = 3;
-  string compose_content = 5;
-  string volumes_content = 6;
+  string compose_content = 4;
 }
 
 // Service Status Messages
@@ -247,12 +246,13 @@ message GetServiceStatusResponse {
 // Service Logs Messages
 message GetServiceLogsRequest {
   string file_name = 1;  // Log file name (if empty, list all available files)
-  int32 lines = 2;       // Number of lines to retrieve (default: 100, tail -n behavior)
+  int32 lines =
+      2;  // Number of lines to retrieve (default: 100, tail -n behavior)
 }
 
 message LogFileInfo {
-  string file_name = 1;   // File name
-  int64 size_bytes = 2;   // File size
+  string file_name = 1;     // File name
+  int64 size_bytes = 2;     // File size
   int64 modified_time = 3;  // Last modified timestamp
 }
 
@@ -264,21 +264,21 @@ message GetServiceLogsResponse {
   repeated LogFileInfo available_files = 3;
 
   // If file_name is specified, return file content
-  string content = 4;       // File content (last N lines)
-  int32 total_lines = 5;    // Total lines returned
+  string content = 4;     // File content (last N lines)
+  int32 total_lines = 5;  // Total lines returned
 }
 
 // Application Logs Messages
 message GetAppLogsRequest {
-  string app_id = 1;          // Application identifier
-  int32 lines = 2;            // Number of lines to retrieve (default: 100)
-  string service_name = 3;    // Optional: specific service in compose (e.g., "web", "broker")
+  string app_id = 1;  // Application identifier
+  int32 lines = 2;    // Number of lines to retrieve (default: 100)
+  string service_name =
+      3;  // Optional: specific service in compose (e.g., "web", "broker")
 }
 
 message GetAppLogsResponse {
   bool success = 1;
   string message = 2;
-  string content = 3;         // Log content from docker compose logs
-  int32 total_lines = 4;      // Total lines returned
+  string content = 3;     // Log content from docker compose logs
+  int32 total_lines = 4;  // Total lines returned
 }
-
