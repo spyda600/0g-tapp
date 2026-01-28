@@ -466,29 +466,32 @@ enable_eventlog = true
         };
 
         // Try to stop the application
-        let result = async {
-            // 1. Stop compose
-            DockerComposeManager::stop_compose(app_id).await?;
-
-            // 2. Delete app directory
-            let app_dir = DockerComposeManager::get_app_dir(app_id);
-            if app_dir.exists() {
-                tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
-                    TappError::Docker(DockerError::ContainerOperationFailed {
-                        operation: "delete_app_dir".to_string(),
-                        reason: format!("Failed to delete app directory: {}", e),
-                    })
-                })?;
-                info!(app_id = %app_id, "App directory deleted successfully");
-            }
-
-            Ok::<_, crate::error::TappError>(())
-        }
-        .await;
+        let result = DockerComposeManager::stop_compose(app_id).await;
 
         // Mark measurement as success or failure based on result
         let final_measurement = match &result {
-            Ok(_) => base_measurement.with_success(),
+            Ok(_) => {
+                // 1. Remove app directory
+                let app_dir = DockerComposeManager::get_app_dir(app_id);
+                if app_dir.exists() {
+                    tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
+                        TappError::Docker(DockerError::ContainerOperationFailed {
+                            operation: "delete_app_dir".to_string(),
+                            reason: format!("Failed to delete app directory: {}", e),
+                        })
+                    })?;
+                }
+                // 2. Clear hash info on successful stop (keep owner info for permission checks)
+                let mut app_info_lock = self.app_info.lock().await;
+                if let Some(info) = app_info_lock.get_mut(app_id) {
+                    info.compose_content.hash.clear();
+                    info.compose_content.content.clear();
+                    info.mount_files.hash.clear();
+                    info.mount_files.content.clear();
+                }
+                info!(app_id = %app_id, "Application stopped successfully, hash info cleared");
+                base_measurement.with_success()
+            }
             Err(e) => base_measurement.with_failure(format!("{}", e)),
         };
 
@@ -509,20 +512,6 @@ enable_eventlog = true
             tracing::error!("Failed to extend measurement for stop operation: {}", e);
         }
 
-        // Clear hash info on successful stop (keep owner info for permission checks)
-        if result.is_ok() {
-            let mut app_info_lock = self.app_info.lock().await;
-            if let Some(info) = app_info_lock.get_mut(app_id) {
-                // Clear hash and content to indicate app is stopped
-                info.compose_content.hash.clear();
-                info.compose_content.content.clear();
-                info.mount_files.hash.clear();
-                info.mount_files.content.clear();
-            }
-            info!(app_id = %app_id, "Application stopped successfully, hash info cleared");
-        }
-
-        // Return the original result
         result
     }
 
@@ -664,6 +653,128 @@ enable_eventlog = true
         );
 
         Ok(())
+    }
+
+    /// Docker logout from registry
+    pub async fn stop_service(&self, app_id: &str, service_name: &str) -> TappResult<()> {
+        info!(app_id = %app_id, service_name = %service_name, "Stopping service");
+
+        // Get AppInfo for this app (to use for stop operation measurement)
+        let app_info = {
+            let app_info_lock = self.app_info.lock().await;
+            app_info_lock.get(app_id).cloned()
+        };
+
+        let app_info = match app_info {
+            Some(info) => info,
+            None => {
+                return Err(TappError::InvalidParameter {
+                    field: "app_id".to_string(),
+                    reason: format!("App {} not found or not running", app_id),
+                });
+            }
+        };
+
+        // Create measurement for stop operation based on app info
+        let base_measurement = AppMeasurement {
+            app_id: app_id.to_string(),
+            operation: crate::measurement_service::OPERATION_NAME_STOP_APP.to_string(),
+            result: String::new(),
+            error: None,
+            compose_hash: app_info.compose_content.hash.clone(),
+            volumes_hash: app_info.mount_files.hash.clone(),
+            deployer: app_info.owner.clone(),
+            timestamp: crate::utils::current_timestamp(),
+        };
+
+        // Try to stop the application
+        let result = DockerComposeManager::stop_service(app_id, service_name).await;
+        let final_measurement = match &result {
+            Ok(_) => base_measurement.with_success(),
+            Err(e) => base_measurement.with_failure(format!("{}", e)),
+        };
+
+        // Extend runtime measurement
+        let measurement_json = serde_json::to_string(&final_measurement)
+            .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
+
+        info!("stop_service measurement_json: {}", measurement_json);
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                crate::measurement_service::OPERATION_NAME_STOP_SERVICE,
+                &measurement_json,
+            )
+            .await
+        {
+            tracing::error!("Failed to extend measurement for stop operation: {}", e);
+        }
+
+        result
+    }
+
+    /// Docker logout from registry
+    pub async fn start_service(
+        &self,
+        app_id: &str,
+        service_name: &str,
+        pull_image: bool,
+    ) -> TappResult<()> {
+        info!(app_id = %app_id, service_name = %service_name, "Starting service");
+
+        // Get AppInfo for this app (to use for stop operation measurement)
+        let app_info = {
+            let app_info_lock = self.app_info.lock().await;
+            app_info_lock.get(app_id).cloned()
+        };
+
+        let app_info = match app_info {
+            Some(info) => info,
+            None => {
+                return Err(TappError::InvalidParameter {
+                    field: "app_id".to_string(),
+                    reason: format!("App {} not found or not running", app_id),
+                });
+            }
+        };
+
+        // Create measurement for stop operation based on app info
+        let base_measurement = AppMeasurement {
+            app_id: app_id.to_string(),
+            operation: crate::measurement_service::OPERATION_NAME_START_SERVICE.to_string(),
+            result: String::new(),
+            error: None,
+            compose_hash: app_info.compose_content.hash.clone(),
+            volumes_hash: app_info.mount_files.hash.clone(),
+            deployer: app_info.owner.clone(),
+            timestamp: crate::utils::current_timestamp(),
+        };
+
+        // Try to start the service
+        let result = DockerComposeManager::start_service(app_id, service_name, pull_image).await;
+
+        let final_measurement = match &result {
+            Ok(_) => base_measurement.with_success(),
+            Err(e) => base_measurement.with_failure(format!("{}", e)),
+        };
+
+        // Extend runtime measurement
+        let measurement_json = serde_json::to_string(&final_measurement)
+            .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize: {}\"}}", e));
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                crate::measurement_service::OPERATION_NAME_START_SERVICE,
+                &measurement_json,
+            )
+            .await
+        {
+            tracing::error!("Failed to extend measurement for start operation: {}", e);
+        }
+
+        result
     }
 }
 

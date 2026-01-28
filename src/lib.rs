@@ -1109,7 +1109,7 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<DockerLoginRequest>,
     ) -> Result<Response<DockerLoginResponse>, Status> {
-        info!("Processing DockerLogin request");
+        info!("Calling DockerLogin");
         let signer = auth_layer::get_signer_address(&request);
 
         let req = request.into_inner();
@@ -1169,7 +1169,7 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<DockerLogoutRequest>,
     ) -> Result<Response<DockerLogoutResponse>, Status> {
-        info!("Processing DockerLogout request");
+        info!("Calling DockerLogout");
         let signer = auth_layer::get_signer_address(&request);
 
         let req = request.into_inner();
@@ -1217,6 +1217,22 @@ impl TappService for TappServiceImpl {
             registry: actual_registry,
             timestamp: chrono::Utc::now().timestamp(),
         }))
+    }
+
+    async fn stop_service(
+        &self,
+        request: Request<StopServiceRequest>,
+    ) -> Result<Response<StopServiceResponse>, Status> {
+        info!("Calling StopService");
+        todo!()
+    }
+
+    async fn start_service(
+        &self,
+        request: Request<StartServiceRequest>,
+    ) -> Result<Response<StartServiceResponse>, Status> {
+        info!("Calling StartService");
+        todo!()
     }
 }
 

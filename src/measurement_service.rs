@@ -15,6 +15,8 @@ pub const OPERATION_NAME_REMOVE_FROM_WHITELIST: &str = "remove_from_whitelist";
 pub const OPERATION_NAME_WITHDRAW_BALANCE: &str = "withdraw_balance";
 pub const OPERATION_NAME_DOCKER_LOGIN: &str = "docker_login";
 pub const OPERATION_NAME_DOCKER_LOGOUT: &str = "docker_logout";
+pub const OPERATION_NAME_STOP_SERVICE: &str = "stop_service";
+pub const OPERATION_NAME_START_SERVICE: &str = "start_service";
 
 pub struct MeasurementService {
     aa: Arc<Mutex<AttestationAgent>>,

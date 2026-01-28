@@ -396,6 +396,112 @@ impl DockerComposeManager {
         let logs = String::from_utf8_lossy(&output.stdout).to_string();
         Ok(logs)
     }
+
+    /// Stop a specific service within an app
+    pub async fn stop_service(app_id: &str, service_name: &str) -> TappResult<()> {
+        let app_dir = Self::get_app_dir(app_id);
+
+        let output = tokio::process::Command::new("docker")
+            .args(&["compose", "stop", service_name])
+            .current_dir(&app_dir)
+            .output()
+            .await
+            .map_err(|e| {
+                TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "stop_service".to_string(),
+                    reason: format!("Failed to execute docker compose stop: {}", e),
+                })
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                app_id = %app_id,
+                stderr = %stderr,
+                "❌ Docker stop service failed"
+            );
+            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                operation: "stop".to_string(),
+                reason: format!("docker stop service failed: {}", stderr),
+            }));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        info!(
+            app_id = %app_id,
+            output = %stdout,
+            "✅ Docker stop service completed successfully"
+        );
+
+        Ok(())
+    }
+
+    /// Start a specific service within an app
+    pub async fn start_service(
+        app_id: &str,
+        service_name: &str,
+        pull_image: bool,
+    ) -> TappResult<()> {
+        let app_dir = Self::get_app_dir(app_id);
+
+        if !app_dir.exists() {
+            return Err(TappError::InvalidParameter {
+                field: "app_id".to_string(),
+                reason: format!("App {} not found", app_id),
+            });
+        }
+
+        info!(
+            app_id = %app_id,
+            service_name = %service_name,
+            pull_image = pull_image,
+            "🚀 Starting service"
+        );
+
+        // Build docker compose up command
+        let mut args = vec!["compose", "up", "-d"];
+        if pull_image {
+            args.extend_from_slice(&["--pull", "always"]);
+        }
+        args.push(service_name);
+
+        // Execute docker compose up -d [--pull always] <service_name> in app directory
+        let output = tokio::process::Command::new("docker")
+            .args(&args)
+            .current_dir(&app_dir)
+            .output()
+            .await
+            .map_err(|e| {
+                TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "start_service".to_string(),
+                    reason: format!("Failed to execute docker compose up: {}", e),
+                })
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                app_id = %app_id,
+                service_name = %service_name,
+                stderr = %stderr,
+                "❌ Docker compose up service failed"
+            );
+            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                operation: "start_service".to_string(),
+                reason: format!("docker compose up {} failed: {}", service_name, stderr),
+            }));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        info!(
+            app_id = %app_id,
+            service_name = %service_name,
+            output = %stdout,
+            "✅ Service started successfully"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

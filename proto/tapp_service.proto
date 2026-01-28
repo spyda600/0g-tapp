@@ -71,6 +71,13 @@ service TappService {
 
   // Logout from Docker registry
   rpc DockerLogout(DockerLogoutRequest) returns (DockerLogoutResponse);
+
+  // Service-level Operations
+  // Stop a specific service within an app
+  rpc StopService(StopServiceRequest) returns (StopServiceResponse);
+
+  // Start a specific service within an app
+  rpc StartService(StartServiceRequest) returns (StartServiceResponse);
 }
 
 enum LogLevel {
@@ -495,4 +502,33 @@ message DockerLogoutResponse {
   string message = 2;
   string registry = 3;  // Registry that was logged out from
   int64 timestamp = 4;  // Operation timestamp
+}
+
+// Service-level Operation Messages
+message StopServiceRequest {
+  string app_id = 1;        // Application identifier
+  string service_name = 2;  // Service name from docker-compose.yml
+}
+
+message StopServiceResponse {
+  bool success = 1;
+  string message = 2;
+  string app_id = 3;        // Application identifier
+  string service_name = 4;  // Service that was stopped
+  int64 timestamp = 5;      // Operation timestamp
+}
+
+message StartServiceRequest {
+  string app_id = 1;        // Application identifier
+  string service_name = 2;  // Service name from docker-compose.yml
+  bool pull_image = 3;      // Whether to pull latest image (default: false)
+}
+
+message StartServiceResponse {
+  bool success = 1;
+  string message = 2;
+  string app_id = 3;        // Application identifier
+  string service_name = 4;  // Service that was started
+  bool pulled_image = 5;    // Whether image was pulled
+  int64 timestamp = 6;      // Operation timestamp
 }
