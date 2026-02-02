@@ -457,33 +457,71 @@ enable_eventlog = true
         &self,
         request: GetEvidenceRequest,
     ) -> TappResult<GetEvidenceResponse> {
-        // Prepare report data
-        let report_data = if request.report_data.is_empty() {
-            // Use zero-filled 64 bytes as default
-            vec![0u8; 64]
-        } else {
-            // Validate and pad report data to 64 bytes
-            if request.report_data.len() > 64 {
-                return Err(DockerError::InvalidComposeContent {
-                    reason: format!(
-                        "Report data must be at most 64 bytes, got {}",
-                        request.report_data.len()
-                    ),
-                }
-                .into());
-            }
-            let mut padded = request.report_data.clone();
-            padded.resize(64, 0);
-            padded
+        // Get app_id from request
+        let app_id = request.app_id;
+        if app_id.is_empty() {
+            return Err(TappError::InvalidParameter {
+                field: "app_id".to_string(),
+                reason: "app_id cannot be empty".to_string(),
+            });
+        }
+
+        // Get AppInfo to retrieve owner (EVM address)
+        let app_info = {
+            let app_info_lock = self.app_info.lock().await;
+            app_info_lock.get(&app_id).cloned()
         };
 
-        info!("report_data: {:?}", hex::encode(&report_data));
+        let owner = match app_info {
+            Some(info) => info.owner,
+            None => {
+                return Err(TappError::InvalidParameter {
+                    field: "app_id".to_string(),
+                    reason: format!("App {} not found", app_id),
+                });
+            }
+        };
+
+        // Convert EVM address to bytes for report_data
+        // EVM address format: "0x" + 40 hex characters = 20 bytes
+        let evm_address_bytes = {
+            // Remove 0x prefix if present
+            let address_hex = owner.trim_start_matches("0x").trim_start_matches("0X");
+
+            // Validate length (should be 40 hex characters = 20 bytes)
+            if address_hex.len() != 40 {
+                return Err(TappError::InvalidParameter {
+                    field: "owner".to_string(),
+                    reason: format!(
+                        "Invalid EVM address format: expected 40 hex characters, got {}",
+                        address_hex.len()
+                    ),
+                });
+            }
+
+            // Decode hex to bytes
+            hex::decode(address_hex).map_err(|e| TappError::InvalidParameter {
+                field: "owner".to_string(),
+                reason: format!("Failed to decode EVM address: {}", e),
+            })?
+        };
+
+        // Prepare report_data: pad EVM address (20 bytes) to 64 bytes
+        let mut report_data = vec![0u8; 64];
+        report_data[..evm_address_bytes.len()].copy_from_slice(&evm_address_bytes);
+
+        info!(
+            app_id = %app_id,
+            owner = %owner,
+            report_data = %hex::encode(&report_data),
+            "Generating evidence with app owner as report_data"
+        );
 
         let evidence = self.measurement_service.get_evidence(&report_data).await?;
         let tee_type = self.measurement_service.get_tee_type().await;
         Ok(GetEvidenceResponse {
             success: true,
-            message: "Evidence generated successfully".to_string(),
+            message: format!("Evidence generated successfully for app {}", app_id),
             evidence,
             tee_type,
             timestamp: crate::utils::current_timestamp(),

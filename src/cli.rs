@@ -51,12 +51,12 @@ enum Commands {
         private_key: String,
     },
 
-    /// Get attestation evidence with custom report data
+    /// Get attestation evidence for an application
     GetEvidence {
-        /// Custom report data (hex encoded, up to 64 bytes, with or without 0x prefix)
-        /// If not provided, will use zero-filled 64 bytes
-        #[arg(short, long, default_value = "")]
-        report_data: String,
+        /// Application ID
+        /// The EVM address (owner) of the app will be automatically used as report_data
+        #[arg(short, long)]
+        app_id: String,
     },
 
     /// Get application public key (public interface)
@@ -131,8 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             stop_app(&cli.server, app_id, private_key).await?;
         }
-        Commands::GetEvidence { report_data } => {
-            get_evidence(&cli.server, report_data).await?;
+        Commands::GetEvidence { app_id } => {
+            get_evidence(&cli.server, app_id).await?;
         }
         Commands::GetAppKey { app_id, key_type } => {
             get_app_key(&cli.server, app_id, key_type).await?;
@@ -221,51 +221,28 @@ async fn start_app(
     Ok(())
 }
 
-async fn get_evidence(
-    server: &str,
-    report_data_hex: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = TappServiceClient::connect(server.to_string()).await?;
 
-    // Decode report data if provided
-    let report_data_bytes = if report_data_hex.is_empty() {
-        vec![]
-    } else {
-        // Remove 0x prefix if present
-        let hex_str = report_data_hex
-            .trim_start_matches("0x")
-            .trim_start_matches("0X");
-
-        // Validate and decode
-        if hex_str.len() > 128 {
-            eprintln!(
-                "ERROR: Report data must be at most 64 bytes (128 hex characters), got {}",
-                hex_str.len()
-            );
-            std::process::exit(1);
-        }
-
-        hex::decode(hex_str)?
-    };
+    if app_id.is_empty() {
+        eprintln!("ERROR: app_id cannot be empty");
+        std::process::exit(1);
+    }
 
     let request = Request::new(GetEvidenceRequest {
-        report_data: report_data_bytes.clone(),
+        app_id: app_id.clone(),
     });
 
     let response = client.get_evidence(request).await?;
     let result = response.into_inner();
 
     println!("✓ Evidence generated successfully");
+    println!("  App ID: {}", app_id);
     println!("  TEE Type: {}", result.tee_type);
     println!("  Timestamp: {}", result.timestamp);
     println!("  Evidence (hex): {}", hex::encode(&result.evidence));
     println!("  Evidence (base64): {}", base64::encode(&result.evidence));
-
-    if !report_data_bytes.is_empty() {
-        println!("\nReport data used: 0x{}", hex::encode(&report_data_bytes));
-    } else {
-        println!("\nReport data: (empty, will use zero-filled 64 bytes)");
-    }
+    println!("\nNote: The EVM address (owner) of the app was used as report_data");
 
     Ok(())
 }

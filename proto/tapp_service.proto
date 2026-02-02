@@ -194,10 +194,9 @@ message ListAppMeasurementsResponse {
 
 // Get Evidence Messages
 message GetEvidenceRequest {
-  bytes report_data =
-      1;  // Custom report data (up to 64 bytes) to be included in the quote
-          // Can be nonce, hash of business data, or any custom data
-          // If empty, will use zero-filled 64 bytes
+  string app_id = 1;  // Application identifier
+                      // The EVM address (owner) of the app will be
+                      // automatically used as report_data
 }
 
 message GetEvidenceResponse {
