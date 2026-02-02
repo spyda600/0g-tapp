@@ -129,9 +129,8 @@ impl TappServiceImpl {
         let task_manager = Arc::new(task_manager::TaskManager::new());
 
         // Initialize BootService with measurement_service and task_manager
-        let boot_service = Arc::new(
-            BootService::new(&config.boot, measurement_service.clone(), task_manager).await?,
-        );
+        let boot_service =
+            Arc::new(BootService::new(measurement_service.clone(), task_manager).await?);
 
         // Initialize AppKeyService
         let app_key_service = if let Some(ref kbs) = config.kbs {
@@ -187,7 +186,7 @@ impl TappService for TappServiceImpl {
         debug!("Request: {:?}", request);
         let signer = auth_layer::get_signer_address(&request);
         let req_inner = request.into_inner();
-        let app_id = req_inner.app_id.clone();
+        // let app_id = req_inner.app_id.clone();
 
         // Get deployer address (signer EVM address)
         // If no signer (auth disabled), use a default placeholder
@@ -203,20 +202,20 @@ impl TappService for TappServiceImpl {
             .await?;
 
         // Record ownership if permission management is enabled
-        if let Some(pm) = &self.permission_manager {
-            if let Some(signer_addr) = signer {
-                pm.record_app_start(app_id.clone(), signer_addr.clone())
-                    .await;
+        // if let Some(pm) = &self.permission_manager {
+        //     if let Some(signer_addr) = signer {
+        //         pm.record_app_start(app_id.clone(), signer_addr.clone())
+        //             .await;
 
-                info!(
-                    app_id = %app_id,
-                    owner = %signer_addr,
-                    deployer = %deployer,
-                    event = "APP_OWNERSHIP_RECORDED",
-                    "App ownership recorded"
-                );
-            }
-        }
+        //         info!(
+        //             app_id = %app_id,
+        //             owner = %signer_addr,
+        //             deployer = %deployer,
+        //             event = "APP_OWNERSHIP_RECORDED",
+        //             "App ownership recorded"
+        //         );
+        //     }
+        // }
 
         Ok(Response::new(response))
     }
@@ -341,11 +340,11 @@ impl TappService for TappServiceImpl {
 
         // Default to "ethereum" if key_type is not specified
         // TODO: Remove
-        let key_type = if req.key_type.is_empty() {
-            "ethereum"
-        } else {
-            &req.key_type
-        };
+        // let key_type = if req.key_type.is_empty() {
+        //     "ethereum"
+        // } else {
+        //     &req.key_type
+        // };
 
         let response = self.app_key_service.get_public_key(&req.app_id).await?;
         Ok(Response::new(GetAppKeyResponse {
@@ -452,6 +451,7 @@ impl TappService for TappServiceImpl {
             error: None,
             compose_hash: app_info.compose_content.hash.clone(),
             volumes_hash: app_info.mount_files.hash.clone(),
+            image_hash: app_info.compose_content.image_hash.clone(),
             deployer: app_info.owner.clone(),
             timestamp: utils::current_timestamp(),
         };
@@ -552,7 +552,8 @@ impl TappService for TappServiceImpl {
             app_id,
             owner: app_info.owner,
             compose_hash: app_info.compose_content.hash,
-            volumes_hash: app_info.mount_files.hash,
+            volumes_hash: app_info.mount_files.hash.into_iter().collect(),
+            image_hash: app_info.compose_content.image_hash.into_iter().collect(),
             compose_content: app_info.compose_content.content,
             // volumes_content: app_info.mount_files.content,
         }))
@@ -609,8 +610,6 @@ impl TappService for TappServiceImpl {
                 .as_ref()
                 .cloned()
                 .unwrap_or_default(),
-            socket_path: self.config.boot.socket_path.clone(),
-            container_timeout_seconds: self.config.boot.container_timeout_seconds as i32,
         };
 
         // Build KBS config if available
@@ -1223,16 +1222,170 @@ impl TappService for TappServiceImpl {
         &self,
         request: Request<StopServiceRequest>,
     ) -> Result<Response<StopServiceResponse>, Status> {
+        // Get signer address before consuming request
         info!("Calling StopService");
-        todo!()
+        debug!("Request: {:?}", request);
+        let req_inner = request.into_inner();
+        let app_id = req_inner.app_id.clone();
+        let service_name = req_inner.service_name.clone();
+
+        // Stop the service
+        self.boot_service
+            .stop_service(&app_id, &service_name)
+            .await?;
+
+        Ok(Response::new(StopServiceResponse {
+            success: true,
+            message: format!("Service {}.{} stopped successfully", app_id, service_name),
+            app_id,
+            service_name,
+            timestamp: utils::current_timestamp(),
+        }))
     }
 
     async fn start_service(
         &self,
         request: Request<StartServiceRequest>,
     ) -> Result<Response<StartServiceResponse>, Status> {
+        // Signature validation is handled by AuthLayer
+        // Get signer address before consuming request
         info!("Calling StartService");
-        todo!()
+        debug!("Request: {:?}", request);
+        let req_inner = request.into_inner();
+        let app_id = req_inner.app_id.clone();
+        let service_name = req_inner.service_name.clone();
+        let pull_image = req_inner.pull_image;
+
+        // Start the service (returns task_id for async operation)
+        let task_id = self
+            .boot_service
+            .clone()
+            .start_service(app_id.clone(), service_name.clone(), pull_image)
+            .await?;
+
+        Ok(Response::new(StartServiceResponse {
+            success: true,
+            message: format!(
+                "Task created successfully for starting service {}.{} Use task_id to check status.",
+                app_id, service_name
+            ),
+            task_id,
+            timestamp: utils::current_timestamp(),
+        }))
+    }
+
+    async fn prune_images(
+        &self,
+        request: Request<PruneImagesRequest>,
+    ) -> Result<Response<PruneImagesResponse>, Status> {
+        info!("Calling PruneImages");
+        let signer = auth_layer::get_signer_address(&request);
+
+        let req = request.into_inner();
+        let all = req.all;
+        // Execute docker image prune
+        let result = self.boot_service.prune_images(all).await?;
+
+        tracing::info!(
+            images_deleted = result.images_deleted,
+            space_reclaimed = result.space_reclaimed,
+            signer = %signer.unwrap_or_default(),
+            event = "DOCKER_PRUNE_IMAGES_SUCCESS",
+            "Docker image prune successful"
+        );
+
+        Ok(Response::new(PruneImagesResponse {
+            success: true,
+            message: format!(
+                "Pruned {} images, reclaimed {} bytes",
+                result.images_deleted, result.space_reclaimed
+            ),
+            images_deleted: result.images_deleted,
+            space_reclaimed: result.space_reclaimed,
+            deleted_images: result.deleted_images,
+            timestamp: chrono::Utc::now().timestamp(),
+        }))
+    }
+
+    async fn get_app_container_status(
+        &self,
+        request: Request<GetAppContainerStatusRequest>,
+    ) -> Result<Response<GetAppContainerStatusResponse>, Status> {
+        info!("Calling GetAppContainerStatus");
+        let signer = auth_layer::get_signer_address(&request);
+
+        let req = request.into_inner();
+        let app_id = req.app_id.clone();
+
+        let _ = self
+            .boot_service
+            .get_app_info(&app_id)
+            .await?
+            .ok_or_else(|| {
+                tracing::warn!(
+                    app_id = %app_id,
+                    event = "SECRET_KEY_ACCESS_DENIED",
+                    reason = "app not found",
+                    "App not found"
+                );
+                Status::not_found(format!("App {} not found", app_id))
+            })?;
+
+        // Get container status (app may not exist, but we still return status)
+        let app_status = self.boot_service.get_app_container_status(&app_id).await?;
+
+        // Convert to proto response
+        let containers: Vec<proto::ContainerStatus> = app_status
+            .containers
+            .into_iter()
+            .map(|c| proto::ContainerStatus {
+                name: c.name,
+                state: c.state,
+                health: c.health.unwrap_or_default(),
+                ports: c.ports,
+            })
+            .collect();
+
+        let container_count = app_status.container_count as i32;
+        let running = app_status.running;
+        let started_at = app_status.started_at.unwrap_or(0);
+
+        tracing::info!(
+            app_id = %app_id,
+            container_count = container_count,
+            running = running,
+            containers_len = containers.len(),
+            started_at = started_at,
+            signer = %signer.unwrap_or_default(),
+            event = "GET_APP_CONTAINER_STATUS_SUCCESS",
+            "Get app container status successful"
+        );
+
+        let response = GetAppContainerStatusResponse {
+            success: true,
+            message: format!(
+                "App {} has {} containers, running: {}",
+                app_id, container_count, running
+            ),
+            app_id: app_id.clone(),
+            running,
+            container_count,
+            containers,
+            started_at,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+
+        // Debug: log response fields
+        tracing::debug!(
+            app_id = %response.app_id,
+            running = response.running,
+            container_count = response.container_count,
+            containers_count = response.containers.len(),
+            started_at = response.started_at,
+            "Response fields set"
+        );
+
+        Ok(Response::new(response))
     }
 }
 

@@ -1,10 +1,9 @@
 pub mod manager;
 pub mod measurement;
 
-pub use manager::{AppStatus, ContainerStatus, DockerComposeManager, MountFile};
+pub use manager::{AppStatus, ContainerStatus, DockerComposeManager, MountFile, PruneImagesResult};
 pub use measurement::{AppMeasurement, ComposeMeasurement, HashAlgorithm};
 
-use crate::config::BootServiceConfig;
 use crate::error::{DockerError, TappError, TappResult};
 use crate::measurement_service::MeasurementService;
 use crate::proto::{GetEvidenceRequest, GetEvidenceResponse, StartAppRequest, StartAppResponse};
@@ -13,17 +12,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct AppComposeContent {
     pub hash: String,
     pub content: String,
+    pub image_hash: std::collections::BTreeMap<String, String>, // Map: service_name -> image
 }
 
 #[derive(Clone)]
 pub struct AppMountFiles {
-    pub hash: String,
+    pub hash: std::collections::BTreeMap<String, String>, // Map: file_name -> hash
     pub content: String,
 }
 
@@ -36,8 +36,6 @@ pub struct AppInfo {
 }
 
 pub struct BootService {
-    config: BootServiceConfig,
-    manager: Mutex<DockerComposeManager>,
     app_info: Mutex<HashMap<String, AppInfo>>,
     measurement_service: Arc<MeasurementService>,
     task_manager: Arc<TaskManager>,
@@ -82,15 +80,10 @@ enable_eventlog = true
 
     /// Create new Docker Compose service
     pub async fn new(
-        config: &BootServiceConfig,
         measurement_service: Arc<MeasurementService>,
         task_manager: Arc<TaskManager>,
     ) -> TappResult<Self> {
-        let manager = DockerComposeManager::new(&config.socket_path).await?;
-
         Ok(Self {
-            config: config.clone(),
-            manager: Mutex::new(manager),
             app_info: Mutex::new(HashMap::new()),
             measurement_service,
             task_manager,
@@ -151,31 +144,8 @@ enable_eventlog = true
             })
             .collect();
 
-        // Calculate application measurement once (before we know success/failure)
-        let base_measurement_result = self
-            .calculate_app_measurement(
-                &request,
-                &mount_files,
-                &app_id,
-                &deployer,
-                crate::measurement_service::OPERATION_NAME_START_APP,
-            )
-            .await;
-
-        // Handle the measurement calculation result
-        let (base_measurement, compose_content, volumes_content) = match base_measurement_result {
-            Ok(result) => result,
-            Err(e) => {
-                // If measurement calculation fails, mark task as failed and return
-                self.task_manager
-                    .mark_failed(&task_id, format!("Failed to calculate measurement: {}", e))
-                    .await;
-                return;
-            }
-        };
-
         // Try to start the application
-        let result = async {
+        let deploy_result = async {
             info!(
                 task_id = %task_id,
                 app_id = %app_id,
@@ -184,8 +154,13 @@ enable_eventlog = true
             );
 
             // Start the Docker Compose application with mount files
-            DockerComposeManager::deploy_compose(&app_id, &request.compose_content, &mount_files)
-                .await?;
+            // This returns the actual image hashes from running containers
+            let image_hash = DockerComposeManager::deploy_compose(
+                &app_id,
+                &request.compose_content,
+                &mount_files,
+            )
+            .await?;
 
             info!(
                 task_id = %task_id,
@@ -193,16 +168,74 @@ enable_eventlog = true
                 "Application started successfully"
             );
 
-            Ok::<_, crate::error::TappError>(())
+            Ok::<_, crate::error::TappError>(image_hash)
         }
         .await;
+
+        // Calculate measurement with actual image hashes (or empty map on failure)
+        let (image_hash, measurement_result) = match &deploy_result {
+            Ok(img_hash) => {
+                // Success: use actual image hashes
+                (
+                    img_hash.clone(),
+                    self.calculate_app_measurement(
+                        &request,
+                        &mount_files,
+                        &app_id,
+                        &deployer,
+                        crate::measurement_service::OPERATION_NAME_START_APP,
+                        img_hash.clone(),
+                    )
+                    .await,
+                )
+            }
+            Err(_) => {
+                // Failure: use empty image hash map
+                let empty_map = std::collections::BTreeMap::new();
+                (
+                    empty_map.clone(),
+                    self.calculate_app_measurement(
+                        &request,
+                        &mount_files,
+                        &app_id,
+                        &deployer,
+                        crate::measurement_service::OPERATION_NAME_START_APP,
+                        empty_map,
+                    )
+                    .await,
+                )
+            }
+        };
+
+        // Handle the measurement calculation result
+        let (base_measurement, compose_content, volumes_content) = match measurement_result {
+            Ok(result) => result,
+            Err(e) => {
+                // If measurement calculation fails, cleanup and mark task as failed
+                if deploy_result.is_ok() {
+                    // Cleanup containers if deployment succeeded but measurement failed
+                    if let Err(cleanup_err) = DockerComposeManager::stop_compose(&app_id).await {
+                        tracing::error!(
+                            app_id = %app_id,
+                            error = %cleanup_err,
+                            "Failed to cleanup containers after measurement calculation failure"
+                        );
+                    }
+                }
+                self.task_manager
+                    .mark_failed(&task_id, format!("Failed to calculate measurement: {}", e))
+                    .await;
+                return;
+            }
+        };
 
         // Save values from base_measurement before it's moved
         let compose_hash = base_measurement.compose_hash.clone();
         let volumes_hash = base_measurement.volumes_hash.clone();
+        let image_hash_clone = image_hash.clone();
 
-        // Mark measurement as success or failure based on result
-        let final_measurement = match &result {
+        // Mark measurement as success or failure based on deploy result
+        let final_measurement = match &deploy_result {
             Ok(_) => base_measurement.with_success(),
             Err(e) => base_measurement.with_failure(format!("{}", e)),
         };
@@ -225,7 +258,7 @@ enable_eventlog = true
         }
 
         // Handle result: store AppInfo on success, cleanup on failure
-        match result {
+        match deploy_result {
             Ok(_) => {
                 // Store AppInfo in memory (only on success)
                 let app_info = AppInfo {
@@ -234,6 +267,7 @@ enable_eventlog = true
                     compose_content: AppComposeContent {
                         hash: compose_hash,
                         content: compose_content,
+                        image_hash: image_hash_clone,
                     },
                     mount_files: AppMountFiles {
                         hash: volumes_hash,
@@ -249,6 +283,62 @@ enable_eventlog = true
                     .await;
             }
             Err(e) => {
+                // Before cleanup, get container logs for debugging
+                // This helps diagnose startup failures before containers are removed
+                // First, try to identify failed services and only get their logs
+                let failed_services = DockerComposeManager::get_failed_services(&app_id)
+                    .await
+                    .unwrap_or_default();
+
+                let logs_result = if !failed_services.is_empty() {
+                    // Get logs from failed services only
+                    // Collect logs from each failed service
+                    let mut all_logs = String::new();
+                    let mut has_logs = false;
+
+                    for service in &failed_services {
+                        if let Ok(service_logs) =
+                            DockerComposeManager::get_app_logs(&app_id, 0, Some(service)).await
+                        {
+                            if !service_logs.trim().is_empty() {
+                                if has_logs {
+                                    all_logs.push_str("\n\n");
+                                }
+                                all_logs.push_str(&format!(
+                                    "=== Service: {} ===\n{}",
+                                    service, service_logs
+                                ));
+                                has_logs = true;
+                            }
+                        }
+                    }
+
+                    if has_logs {
+                        Ok(all_logs)
+                    } else {
+                        // Fallback: get all logs if failed to get specific service logs
+                        DockerComposeManager::get_app_logs(&app_id, 0, None).await
+                    }
+                } else {
+                    // No failed services identified, get all logs
+                    DockerComposeManager::get_app_logs(&app_id, 0, None).await
+                };
+                if let Ok(logs) = &logs_result {
+                    if !logs.trim().is_empty() {
+                        tracing::error!(
+                            app_id = %app_id,
+                            logs = %logs,
+                            "Container logs before cleanup"
+                        );
+                    }
+                } else if let Err(log_err) = &logs_result {
+                    tracing::warn!(
+                        app_id = %app_id,
+                        error = %log_err,
+                        "Failed to get container logs before cleanup"
+                    );
+                }
+
                 // Cleanup: stop and remove containers on failure
                 // Note: Failed start already measured above
                 tracing::error!(
@@ -256,6 +346,34 @@ enable_eventlog = true
                     error = %e,
                     "Failed to start application, cleanup containers"
                 );
+
+                // Include logs in error message if available
+                // Limit log size to 1MB to avoid memory issues
+                let error_msg = if let Ok(logs) = logs_result {
+                    if !logs.trim().is_empty() {
+                        // Truncate logs if too large (limit to 1MB)
+                        const MAX_LOG_SIZE: usize = 1024 * 1024; // 1MB
+                        let truncated_logs = if logs.len() > MAX_LOG_SIZE {
+                            let truncated = format!(
+                                "... (truncated, showing last {} bytes) ...\n{}",
+                                MAX_LOG_SIZE,
+                                &logs[logs.len() - MAX_LOG_SIZE..]
+                            );
+                            truncated
+                        } else {
+                            logs
+                        };
+                        format!(
+                            "{}\n\nContainer logs (all services):\n{}",
+                            e, truncated_logs
+                        )
+                    } else {
+                        format!("{}", e)
+                    }
+                } else {
+                    format!("{}", e)
+                };
+
                 if let Err(cleanup_err) = DockerComposeManager::stop_compose(&app_id).await {
                     tracing::error!(
                         app_id = %app_id,
@@ -264,10 +382,8 @@ enable_eventlog = true
                     );
                 }
 
-                // Mark task as failed
-                self.task_manager
-                    .mark_failed(&task_id, format!("{}", e))
-                    .await;
+                // Mark task as failed with logs included
+                self.task_manager.mark_failed(&task_id, error_msg).await;
             }
         }
     }
@@ -408,6 +524,7 @@ enable_eventlog = true
         app_id: &str,
         deployer: &str,  // EVM address from signature
         operation: &str, // Operation name like "start_app"
+        image_hash: std::collections::BTreeMap<String, String>, // Actual image digests from containers
     ) -> TappResult<(AppMeasurement, String, String)> {
         let measurement = ComposeMeasurement::new();
 
@@ -426,6 +543,7 @@ enable_eventlog = true
                 error: None,           // Will be set by with_failure() if needed
                 compose_hash,
                 volumes_hash,
+                image_hash,
                 deployer: deployer.to_string(),
                 timestamp: crate::utils::current_timestamp(),
             },
@@ -461,6 +579,7 @@ enable_eventlog = true
             error: None,
             compose_hash: app_info.compose_content.hash.clone(),
             volumes_hash: app_info.mount_files.hash.clone(),
+            image_hash: app_info.compose_content.image_hash.clone(),
             deployer: app_info.owner.clone(),
             timestamp: crate::utils::current_timestamp(),
         };
@@ -486,6 +605,7 @@ enable_eventlog = true
                 if let Some(info) = app_info_lock.get_mut(app_id) {
                     info.compose_content.hash.clear();
                     info.compose_content.content.clear();
+                    info.compose_content.image_hash.clear();
                     info.mount_files.hash.clear();
                     info.mount_files.content.clear();
                 }
@@ -655,6 +775,16 @@ enable_eventlog = true
         Ok(())
     }
 
+    /// Prune unused Docker images
+    pub async fn prune_images(&self, all: bool) -> TappResult<PruneImagesResult> {
+        DockerComposeManager::prune_images(all).await
+    }
+
+    /// Get application container status
+    pub async fn get_app_container_status(&self, app_id: &str) -> TappResult<AppStatus> {
+        DockerComposeManager::get_app_status(app_id).await
+    }
+
     /// Docker logout from registry
     pub async fn stop_service(&self, app_id: &str, service_name: &str) -> TappResult<()> {
         info!(app_id = %app_id, service_name = %service_name, "Stopping service");
@@ -683,6 +813,7 @@ enable_eventlog = true
             error: None,
             compose_hash: app_info.compose_content.hash.clone(),
             volumes_hash: app_info.mount_files.hash.clone(),
+            image_hash: app_info.compose_content.image_hash.clone(),
             deployer: app_info.owner.clone(),
             timestamp: crate::utils::current_timestamp(),
         };
@@ -716,47 +847,181 @@ enable_eventlog = true
 
     /// Docker logout from registry
     pub async fn start_service(
-        &self,
-        app_id: &str,
-        service_name: &str,
+        self: std::sync::Arc<Self>,
+        app_id: String,
+        service_name: String,
         pull_image: bool,
-    ) -> TappResult<()> {
-        info!(app_id = %app_id, service_name = %service_name, "Starting service");
-
-        // Get AppInfo for this app (to use for stop operation measurement)
-        let app_info = {
+    ) -> TappResult<String> {
+        // Validate that app exists
+        {
             let app_info_lock = self.app_info.lock().await;
-            app_info_lock.get(app_id).cloned()
-        };
-
-        let app_info = match app_info {
-            Some(info) => info,
-            None => {
+            if app_info_lock.get(&app_id).is_none() {
                 return Err(TappError::InvalidParameter {
                     field: "app_id".to_string(),
                     reason: format!("App {} not found or not running", app_id),
                 });
             }
+        }
+
+        // Create a new task
+        let task = self.task_manager.create_task().await;
+        let task_id = task.id.clone();
+
+        info!(
+            task_id = %task_id,
+            app_id = %app_id,
+            service_name = %service_name,
+            "Created task for starting service"
+        );
+
+        // Mark task as running
+        self.task_manager.mark_running(&task_id).await;
+
+        // Clone Arc for background task
+        let service = self.clone();
+        let task_id_clone = task_id.clone();
+
+        // Spawn background task
+        tokio::spawn(async move {
+            service
+                ._start_service(app_id, service_name, pull_image, task_id_clone)
+                .await;
+        });
+
+        Ok(task_id)
+    }
+
+    async fn _start_service(
+        &self,
+        app_id: String,
+        service_name: String,
+        pull_image: bool,
+        task_id: String,
+    ) {
+        info!(
+            task_id = %task_id,
+            app_id = %app_id,
+            service_name = %service_name,
+            "Starting service"
+        );
+
+        // Get AppInfo for this app (to use for measurement)
+        let app_info = {
+            let app_info_lock = self.app_info.lock().await;
+            app_info_lock.get(&app_id).cloned()
         };
 
-        // Create measurement for stop operation based on app info
-        let base_measurement = AppMeasurement {
-            app_id: app_id.to_string(),
+        let app_info = match app_info {
+            Some(info) => info,
+            None => {
+                let error_msg = format!("App {} not found or not running", app_id);
+                tracing::error!(
+                    task_id = %task_id,
+                    app_id = %app_id,
+                    "App not found"
+                );
+                self.task_manager.mark_failed(&task_id, error_msg).await;
+                return;
+            }
+        };
+
+        // Create measurement for start service operation based on app info
+        let mut base_measurement = AppMeasurement {
+            app_id: app_id.clone(),
             operation: crate::measurement_service::OPERATION_NAME_START_SERVICE.to_string(),
             result: String::new(),
             error: None,
             compose_hash: app_info.compose_content.hash.clone(),
             volumes_hash: app_info.mount_files.hash.clone(),
+            image_hash: app_info.compose_content.image_hash.clone(),
             deployer: app_info.owner.clone(),
             timestamp: crate::utils::current_timestamp(),
         };
 
         // Try to start the service
-        let result = DockerComposeManager::start_service(app_id, service_name, pull_image).await;
+        let result = DockerComposeManager::start_service(&app_id, &service_name, pull_image).await;
 
-        let final_measurement = match &result {
-            Ok(_) => base_measurement.with_success(),
-            Err(e) => base_measurement.with_failure(format!("{}", e)),
+        // Update base_measurement with new image hash and handle result
+        let final_measurement = match result {
+            Ok(_) => {
+                info!(
+                    task_id = %task_id,
+                    app_id = %app_id,
+                    service_name = %service_name,
+                    "Service started successfully"
+                );
+
+                // If image was pulled, update image hash
+                if pull_image {
+                    match DockerComposeManager::get_service_image(&app_id, &service_name).await {
+                        Ok(Some(new_image_hash)) => {
+                            // Update AppInfo with new image hash
+                            let mut app_info_lock = self.app_info.lock().await;
+                            if let Some(app_info) = app_info_lock.get_mut(&app_id) {
+                                app_info
+                                    .compose_content
+                                    .image_hash
+                                    .insert(service_name.clone(), new_image_hash.clone());
+                                info!(
+                                    task_id = %task_id,
+                                    app_id = %app_id,
+                                    service_name = %service_name,
+                                    image_hash = %new_image_hash,
+                                    "Updated image hash for service"
+                                );
+                            }
+                            // Update measurement with new image hash
+                            base_measurement
+                                .image_hash
+                                .insert(service_name.clone(), new_image_hash);
+                        }
+                        Ok(None) => {
+                            warn!(
+                                task_id = %task_id,
+                                app_id = %app_id,
+                                service_name = %service_name,
+                                "Could not retrieve image hash for service"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %task_id,
+                                app_id = %app_id,
+                                service_name = %service_name,
+                                error = %e,
+                                "Failed to get image hash for service"
+                            );
+                        }
+                    }
+                }
+
+                // Mark task as completed
+                self.task_manager
+                    .mark_completed(
+                        &task_id,
+                        TaskSuccessResult {
+                            app_id,
+                            deployer: app_info.owner,
+                        },
+                    )
+                    .await;
+
+                base_measurement.with_success()
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = %task_id,
+                    app_id = %app_id,
+                    service_name = %service_name,
+                    error = %e,
+                    "Failed to start service"
+                );
+                self.task_manager
+                    .mark_failed(&task_id, format!("{}", e))
+                    .await;
+
+                base_measurement.with_failure(format!("{}", e))
+            }
         };
 
         // Extend runtime measurement
@@ -771,10 +1036,11 @@ enable_eventlog = true
             )
             .await
         {
-            tracing::error!("Failed to extend measurement for start operation: {}", e);
+            tracing::error!(
+                "Failed to extend measurement for start service operation: {}",
+                e
+            );
         }
-
-        result
     }
 }
 

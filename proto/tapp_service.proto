@@ -72,12 +72,19 @@ service TappService {
   // Logout from Docker registry
   rpc DockerLogout(DockerLogoutRequest) returns (DockerLogoutResponse);
 
+  // Prune unused Docker images
+  rpc PruneImages(PruneImagesRequest) returns (PruneImagesResponse);
+
   // Service-level Operations
   // Stop a specific service within an app
   rpc StopService(StopServiceRequest) returns (StopServiceResponse);
 
   // Start a specific service within an app
   rpc StartService(StartServiceRequest) returns (StartServiceResponse);
+
+  // Get application container status
+  rpc GetAppContainerStatus(GetAppContainerStatusRequest)
+      returns (GetAppContainerStatusResponse);
 }
 
 enum LogLevel {
@@ -253,9 +260,9 @@ message GetAppInfoResponse {
   string app_id = 3;
   string owner = 4;
   string compose_hash = 5;
-  string volumes_hash = 6;
+  map<string, string> volumes_hash = 6;  // Map: file_name -> hash
   string compose_content = 7;
-  // string volumes_content = 8;
+  map<string, string> image_hash = 9;  // Map: service_name -> image_hash
 }
 
 // Get TAPP Info Messages
@@ -282,8 +289,6 @@ message ServerConfigInfo {
 
 message BootConfigInfo {
   string aa_config_path = 1;  // Attestation agent config path
-  string socket_path = 2;     // Docker socket path
-  int32 container_timeout_seconds = 3;
 }
 
 message RetryConfigInfo {
@@ -504,6 +509,21 @@ message DockerLogoutResponse {
   int64 timestamp = 4;  // Operation timestamp
 }
 
+// Docker Prune Images Messages
+message PruneImagesRequest {
+  bool all =
+      1;  // Remove all unused images, not just dangling ones (default: false)
+}
+
+message PruneImagesResponse {
+  bool success = 1;
+  string message = 2;
+  int64 images_deleted = 3;            // Number of images deleted
+  int64 space_reclaimed = 4;           // Disk space reclaimed in bytes
+  repeated string deleted_images = 5;  // List of deleted image IDs/names
+  int64 timestamp = 6;                 // Operation timestamp
+}
+
 // Service-level Operation Messages
 message StopServiceRequest {
   string app_id = 1;        // Application identifier
@@ -527,8 +547,29 @@ message StartServiceRequest {
 message StartServiceResponse {
   bool success = 1;
   string message = 2;
-  string app_id = 3;        // Application identifier
-  string service_name = 4;  // Service that was started
-  bool pulled_image = 5;    // Whether image was pulled
-  int64 timestamp = 6;      // Operation timestamp
+  string task_id = 3;   // Async task identifier for tracking progress
+  int64 timestamp = 4;  // Operation timestamp
+}
+
+// Get App Container Status Messages
+message GetAppContainerStatusRequest {
+  string app_id = 1;  // Application identifier
+}
+
+message GetAppContainerStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string app_id = 3;
+  bool running = 4;                         // Whether the app is running
+  int32 container_count = 5;                // Number of containers
+  repeated ContainerStatus containers = 6;  // Container status details
+  int64 started_at = 7;  // App start timestamp (Unix timestamp)
+  int64 timestamp = 8;   // Response timestamp
+}
+
+message ContainerStatus {
+  string name = 1;            // Container name
+  string state = 2;           // Container state (running, stopped, etc.)
+  string health = 3;          // Health status (if available)
+  repeated string ports = 4;  // Port mappings (e.g., "0.0.0.0:8080->80/tcp")
 }

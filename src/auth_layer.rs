@@ -212,11 +212,13 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "AddToWhitelist"
         | "RemoveFromWhitelist"
         | "ListWhitelist"
-        | "ListAllOwnerships" => MethodPermission::OwnerOnly,
+        | "ListAllOwnerships"
+        | "StopService"
+        | "StartService" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
         "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" | "DockerLogin"
-        | "DockerLogout" => MethodPermission::Whitelist,
+        | "DockerLogout" | "PruneImages" => MethodPermission::Whitelist,
 
         // Default: require owner permission
         _ => {

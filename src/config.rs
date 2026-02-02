@@ -15,14 +15,6 @@ pub struct BootServiceConfig {
     /// Attestation agent configuration
     #[serde(default)]
     pub aa_config_path: Option<String>,
-
-    /// Docker socket path
-    #[serde(default = "default_docker_socket")]
-    pub socket_path: String,
-
-    /// Container startup timeout in seconds
-    #[serde(default = "default_container_timeout")]
-    pub container_timeout_seconds: u64,
 }
 
 /// Logging configuration
@@ -247,8 +239,6 @@ impl Default for BootServiceConfig {
     fn default() -> Self {
         Self {
             aa_config_path: Some("config/attestation-agent.toml".to_string()),
-            socket_path: default_docker_socket(),
-            container_timeout_seconds: default_container_timeout(),
         }
     }
 }

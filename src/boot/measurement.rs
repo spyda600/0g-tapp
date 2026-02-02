@@ -2,6 +2,7 @@ use crate::error::{DockerError, TappResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
 use serde_yaml::Value;
+use std::collections::BTreeMap;
 
 /// Hash algorithm for measurement calculation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +35,8 @@ pub struct AppMeasurement {
     pub result: String,
     pub error: Option<String>,
     pub compose_hash: String,
-    pub volumes_hash: String,
+    pub volumes_hash: BTreeMap<String, String>, // Map: file_name -> hash
+    pub image_hash: BTreeMap<String, String>,   // Map: service_name -> image_digest
     pub deployer: String,
     pub timestamp: i64,
 }
@@ -81,23 +83,28 @@ impl ComposeMeasurement {
     pub fn calculate_mount_files_hash(
         &self,
         mount_files: &[crate::boot::manager::MountFile],
-    ) -> TappResult<(String, String)> {
+    ) -> TappResult<(BTreeMap<String, String>, String)> {
+        let mut hash_map = BTreeMap::new();
+
         if mount_files.is_empty() {
-            return Ok((self.hash_algorithm.hash(b""), "".to_string()));
+            return Ok((hash_map, "".to_string()));
         }
 
         // Sort files by source path for deterministic ordering
         let mut sorted_files: Vec<_> = mount_files.iter().collect();
         sorted_files.sort_by(|a, b| a.source_path.cmp(&b.source_path));
 
-        // Calculate leaf hashes (hash of each file content)
-        let leaf_hashes: Vec<String> = sorted_files
-            .iter()
-            .map(|file| self.hash_algorithm.hash(&file.content))
-            .collect();
-
-        // Build Merkle tree to get root hash
-        let root_hash = self.build_merkle_root(&leaf_hashes)?;
+        // Calculate hash for each file and use file name as key
+        for file in sorted_files.iter() {
+            let file_hash = self.hash_algorithm.hash(&file.content);
+            // Extract file name from path (e.g., "./config/nginx.conf" -> "nginx.conf")
+            let file_name = std::path::Path::new(&file.source_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&file.source_path)
+                .to_string();
+            hash_map.insert(file_name, file_hash);
+        }
 
         // Combine file contents with filename headers
         const FILE_SEPARATOR: &str = "\x1E"; // Record Separator
@@ -113,43 +120,7 @@ impl ComposeMeasurement {
             .collect::<Vec<_>>()
             .join(FILE_SEPARATOR);
 
-        Ok((root_hash, combined_content))
-    }
-
-    /// Build Merkle tree root hash from leaf hashes
-    fn build_merkle_root(&self, leaf_hashes: &[String]) -> TappResult<String> {
-        if leaf_hashes.is_empty() {
-            return Ok(self.hash_algorithm.hash(b""));
-        }
-
-        if leaf_hashes.len() == 1 {
-            return Ok(leaf_hashes[0].clone());
-        }
-
-        let mut current_level = leaf_hashes.to_vec();
-
-        // Build tree bottom-up until we get the root
-        while current_level.len() > 1 {
-            let mut next_level = Vec::new();
-
-            // Process pairs of hashes
-            for chunk in current_level.chunks(2) {
-                let combined = if chunk.len() == 2 {
-                    // Combine two hashes
-                    format!("{}{}", chunk[0], chunk[1])
-                } else {
-                    // Odd number: duplicate the last hash (standard Merkle tree approach)
-                    format!("{}{}", chunk[0], chunk[0])
-                };
-
-                let parent_hash = self.hash_algorithm.hash(combined.as_bytes());
-                next_level.push(parent_hash);
-            }
-
-            current_level = next_level;
-        }
-
-        Ok(current_level[0].clone())
+        Ok((hash_map, combined_content))
     }
 
     /// Normalize Docker Compose content for consistent hashing

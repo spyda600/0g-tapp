@@ -176,8 +176,6 @@ if command -v jq &> /dev/null; then
         (if .config.server.permissionEnabled then "\n  Owner Address:   " + (.config.server.ownerAddress // "N/A") else "" end) +
         "\n\n🐳 Boot Configuration:" +
         "\n  AA Config:       " + (.config.boot.aaConfigPath // "N/A") +
-        "\n  Docker Socket:   " + (.config.boot.socketPath // "N/A") +
-        "\n  Container Timeout: " + ((.config.boot.containerTimeoutSeconds | tostring) // "N/A") + "s" +
         (if .config.kbsEnabled then
             "\n\n🔑 KBS Configuration:" +
             "\n  Endpoint:        " + (.config.kbs.endpoint // "N/A") +
