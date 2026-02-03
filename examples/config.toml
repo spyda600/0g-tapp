@@ -21,8 +21,6 @@ initial_whitelist = ["0x0E552ac14124F6f336a4504Aa72c921b4D7F8032"]
 
 [boot]
 # aa_config_path = "/etc/tapp/attestation-agent.toml"
-socket_path = "/var/run/docker.sock"
-container_timeout_seconds = 300
 
 # KBS (Key Broker Service) Configuration
 # If not configured, the service will use in-memory key generation

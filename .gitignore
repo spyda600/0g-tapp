@@ -1,5 +1,10 @@
 /target
 examples/output
 examples/input
+examples/mainnet
+examples/oracle
+examples/testnet
+examples/nginx
 verifier/output
 verifier/input
+config/*

@@ -323,11 +323,16 @@ echo ""
 
 echo "Reading configuration files..."
 
+# Get compose file absolute path and directory
+COMPOSE_FILE_ABS=$(cd "$(dirname "$COMPOSE_FILE")" && pwd)/$(basename "$COMPOSE_FILE")
+COMPOSE_DIR=$(dirname "$COMPOSE_FILE_ABS")
+
 # Read compose file content
-COMPOSE_CONTENT=$(cat "$COMPOSE_FILE")
+COMPOSE_CONTENT=$(cat "$COMPOSE_FILE_ABS")
 
 # Extract local volume mounts - using grep to find all lines with volume patterns
 echo "Scanning for local files to upload..."
+echo "Compose file directory: $COMPOSE_DIR"
 MOUNT_FILES_JSON="[]"
 found_files=0
 
@@ -352,9 +357,9 @@ while IFS= read -r line; do
       continue
     fi
     
-    # Build absolute path
+    # Build absolute path relative to compose file directory
     clean_path="${source_path#./}"
-    file_path="$SCRIPT_DIR/$clean_path"
+    file_path="$COMPOSE_DIR/$clean_path"
     
     # Check if file exists locally
     if [ -f "$file_path" ]; then
@@ -371,14 +376,14 @@ while IFS= read -r line; do
       echo "  ⊘ Skipped: $source_path (file not found at $file_path)"
     fi
   fi
-done < "$COMPOSE_FILE"
+done < "$COMPOSE_FILE_ABS"
 
 if [ $found_files -eq 0 ]; then
   echo "  ⚠️  No local files found to upload"
   echo ""
   echo "  Debug: Searching for volume patterns in compose file..."
   echo "  Lines with './' pattern:"
-  grep -n '\.\/' "$COMPOSE_FILE" || echo "  (none found)"
+  grep -n '\.\/' "$COMPOSE_FILE_ABS" || echo "  (none found)"
   echo ""
 fi
 
