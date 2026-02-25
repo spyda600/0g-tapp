@@ -472,13 +472,13 @@ fn extract_volume_mounts(
 
                     let source_path = parts[0].trim();
 
-                    // Only process local paths starting with ./
-                    if !source_path.starts_with("./") {
+                    // Only process relative local paths (starting with ./ or ../)
+                    if !source_path.starts_with("./") && !source_path.starts_with("../") {
                         continue;
                     }
 
-                    // Build absolute path
-                    let local_file = compose_dir.join(&source_path[2..]); // Remove "./"
+                    // Build absolute path (PathBuf::join handles ../ correctly)
+                    let local_file = compose_dir.join(source_path);
 
                     // Check if file exists
                     if local_file.exists() && local_file.is_file() {
@@ -1393,4 +1393,72 @@ fn add_signature_metadata<T>(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn make_compose(volumes: &[&str]) -> String {
+        let volume_lines: String = volumes
+            .iter()
+            .map(|v| format!("      - {}\n", v))
+            .collect();
+        format!(
+            "services:\n  app:\n    image: test\n    volumes:\n{}",
+            volume_lines
+        )
+    }
+
+    #[test]
+    fn test_extract_dot_slash_paths() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "config.yaml", "key: value");
+
+        let compose_path = tmp.path().join("docker-compose.yaml");
+        let content = make_compose(&["./config.yaml:/etc/config.yaml"]);
+
+        let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source_path, "./config.yaml");
+    }
+
+    #[test]
+    fn test_extract_dot_dot_paths() {
+        let tmp = TempDir::new().unwrap();
+        // Create file one level up from compose dir
+        write_file(tmp.path(), "sibling/config.yaml", "key: value");
+
+        let compose_dir = tmp.path().join("deploy");
+        fs::create_dir_all(&compose_dir).unwrap();
+        let compose_path = compose_dir.join("docker-compose.yaml");
+        let content = make_compose(&["../sibling/config.yaml:/etc/config.yaml"]);
+
+        let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
+        assert_eq!(mounts.len(), 1, "../ paths should now be uploaded");
+        assert_eq!(mounts[0].source_path, "../sibling/config.yaml");
+    }
+
+    #[test]
+    fn test_skip_named_volumes_and_absolute_paths() {
+        let tmp = TempDir::new().unwrap();
+        let compose_path = tmp.path().join("docker-compose.yaml");
+        let content = make_compose(&[
+            "myvolume:/data",
+            "/absolute/path:/etc/file",
+        ]);
+
+        let mounts = extract_volume_mounts(&compose_path, &content).unwrap();
+        assert!(mounts.is_empty(), "named volumes and absolute paths must be skipped");
+    }
 }

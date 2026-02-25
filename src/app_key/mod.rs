@@ -69,8 +69,8 @@ impl AppKeyService {
         // Remove the 0x04 prefix to get 64 bytes for address calculation
         let public_key_without_prefix = &public_key_bytes[1..];
 
-        // Store complete public key (with prefix) if needed
-        let public_key = public_key_bytes.to_vec();
+        // Store 64-byte public key (without 0x04 prefix), consistent with verify_signature()
+        let public_key = public_key_without_prefix.to_vec();
 
         // Generate x25519 key pair if requested
         // Compatible with eciesjs: directly use secp256k1 private key as x25519 private key
