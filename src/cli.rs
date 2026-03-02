@@ -429,6 +429,40 @@ fn require_private_key(key: &Option<String>) -> Result<String, Box<dyn std::erro
     })
 }
 
+/// Recursively collect all files under a directory into MountFile entries.
+/// `dir` is the directory to walk, `base_dir` is the root of the mount source
+/// (so relative paths are computed from base_dir's parent), and `source_prefix`
+/// is the original source path string from the compose file (e.g. `./nginx/ssl`).
+fn collect_dir_files(
+    dir: &std::path::Path,
+    base_dir: &std::path::Path,
+    source_prefix: &str,
+    files: &mut Vec<MountFile>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let rel = path
+                .strip_prefix(base_dir)
+                .map_err(|e| format!("strip_prefix error: {}", e))?;
+            let file_source_path =
+                format!("{}/{}", source_prefix.trim_end_matches('/'), rel.to_string_lossy());
+            let content = std::fs::read(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            println!("    ✓ Found: {}", file_source_path);
+            files.push(MountFile {
+                source_path: file_source_path,
+                content,
+                mode: "0644".to_string(),
+            });
+        } else if path.is_dir() {
+            collect_dir_files(&path, base_dir, source_prefix, files)?;
+        }
+    }
+    Ok(())
+}
+
 /// Extract local volume mounts from docker-compose.yml content
 fn extract_volume_mounts(
     compose_file: &PathBuf,
@@ -480,7 +514,7 @@ fn extract_volume_mounts(
                     // Build absolute path (PathBuf::join handles ../ correctly)
                     let local_file = compose_dir.join(source_path);
 
-                    // Check if file exists
+                    // Check if path exists as file or directory
                     if local_file.exists() && local_file.is_file() {
                         println!("  ✓ Found: {} -> {}", source_path, local_file.display());
 
@@ -494,9 +528,12 @@ fn extract_volume_mounts(
                             content,
                             mode: "0644".to_string(),
                         });
+                    } else if local_file.exists() && local_file.is_dir() {
+                        println!("  ✓ Dir:   {} -> {}", source_path, local_file.display());
+                        collect_dir_files(&local_file, &local_file, source_path, &mut mount_files)?;
                     } else {
                         println!(
-                            "  ⊘ Skipped: {} (file not found at {})",
+                            "  ⊘ Skipped: {} (not found at {})",
                             source_path,
                             local_file.display()
                         );

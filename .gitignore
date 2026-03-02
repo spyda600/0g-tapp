@@ -4,6 +4,7 @@ examples/input
 examples/mainnet
 examples/oracle
 examples/testnet
+examples/dev
 examples/nginx
 verifier/output
 verifier/input
