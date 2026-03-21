@@ -93,66 +93,60 @@ impl NitroProvider {
             accumulator: Mutex::new(MeasurementAccumulator::new()),
         }
     }
-}
 
-impl NitroProvider {
-    /// Generate an attestation document via the Nitro Security Module (NSM).
+    /// Generate an attestation document via the Nitro Security Module.
     ///
-    /// The NSM hardware signs a COSE Sign1 document containing:
-    /// - PCR0-PCR8: static enclave image measurements (set at launch)
-    /// - user_data: our MeasurementAccumulator output (runtime measurements)
-    /// - nonce: the caller's challenge (runtime_data)
-    ///
-    /// Returns the raw CBOR-encoded attestation document bytes.
+    /// Uses the `aws-nitro-enclaves-nsm-api` crate which communicates with
+    /// `/dev/nsm` via ioctl. The returned COSE Sign1 document is signed by
+    /// AWS Nitro Attestation PKI and contains PCRs, user_data, and nonce.
+    #[cfg(feature = "nitro")]
     fn nsm_get_attestation_doc(user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
-        use aws_nitro_enclaves_nsm_api::api::Request;
-        use aws_nitro_enclaves_nsm_api::driver as nsm_driver;
+        use aws_nitro_enclaves_nsm_api::api::{Request, Response};
+        use aws_nitro_enclaves_nsm_api::driver;
 
-        let nsm_fd = nsm_driver::nsm_init();
-        if nsm_fd < 0 {
-            return Err(TeeError::AttestationFailed(
-                "Failed to open NSM device".to_string(),
-            ));
-        }
+        let nsm_fd = driver::nsm_init();
 
         let request = Request::Attestation {
             user_data: if user_data.is_empty() {
                 None
             } else {
-                Some(user_data.into())
+                Some(user_data.to_vec().into())
             },
             nonce: if nonce.is_empty() {
                 None
             } else {
-                Some(nonce.into())
+                Some(nonce.to_vec().into())
             },
             public_key: None,
         };
 
-        let response = nsm_driver::nsm_process_request(nsm_fd, request);
-
-        // Close the NSM fd
-        nsm_driver::nsm_exit(nsm_fd);
+        let response = driver::nsm_process_request(nsm_fd, request);
+        driver::nsm_exit(nsm_fd);
 
         match response {
-            aws_nitro_enclaves_nsm_api::api::Response::Attestation { document } => {
+            Response::Attestation { document } => {
                 info!(
                     doc_len = document.len(),
                     "NSM attestation document generated"
                 );
                 Ok(document)
             }
-            aws_nitro_enclaves_nsm_api::api::Response::Error(err) => {
-                Err(TeeError::AttestationFailed(format!(
-                    "NSM attestation failed: {:?}",
-                    err
-                )))
-            }
+            Response::Error(err) => Err(TeeError::AttestationFailed(format!(
+                "NSM attestation failed: {:?}",
+                err
+            ))),
             other => Err(TeeError::AttestationFailed(format!(
                 "Unexpected NSM response: {:?}",
                 other
             ))),
         }
+    }
+
+    #[cfg(not(feature = "nitro"))]
+    fn nsm_get_attestation_doc(_user_data: &[u8], _nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
+        Err(TeeError::AttestationFailed(
+            "NSM attestation requires the 'nitro' feature and a Nitro Enclave environment".to_string(),
+        ))
     }
 }
 
