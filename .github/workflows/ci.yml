@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check-format:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (simulation)
+        run: cargo clippy --features simulation --all-targets -- -D warnings
+
+  build-simulation:
+    name: Build (simulation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --features simulation
+      - name: Run tests
+        run: cargo test --features simulation
+
+  build-docker-aws:
+    name: Docker Build (AWS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AWS Docker image
+        run: docker build --build-arg TARGET=aws -f Dockerfile.multi -t tapp:aws .
+
+  build-docker-alibaba:
+    name: Docker Build (Alibaba)
+    runs-on: ubuntu-latest
+    # Only build Alibaba image on main branch (needs China repos)
+    if: github.ref == 'refs/heads/main'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Alibaba Docker image
+        run: docker build --build-arg TARGET=alibaba -f Dockerfile.multi -t tapp:alibaba .

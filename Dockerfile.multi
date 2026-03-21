@@ -1,0 +1,91 @@
+# Multi-target Dockerfile for 0G TAPP
+# Usage:
+#   docker build --build-arg TARGET=aws -f Dockerfile.multi .
+#   docker build --build-arg TARGET=alibaba -f Dockerfile.multi .
+
+ARG TARGET=aws
+
+# ============================================================
+# Stage 1: Builder (Amazon Linux 2023)
+# ============================================================
+FROM amazonlinux:2023 AS builder-aws
+
+RUN dnf install -y \
+    gcc gcc-c++ make cmake \
+    openssl-devel protobuf-compiler \
+    git curl pkg-config \
+    && dnf clean all
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY rust-toolchain.toml .
+RUN rustup show
+
+COPY Cargo.toml Cargo.lock ./
+COPY proto/ proto/
+COPY build.rs .
+COPY src/ src/
+
+# Build with Nitro feature for AWS target
+# Reproducible build flags
+ENV SOURCE_DATE_EPOCH=0
+RUN cargo build --release --features simulation \
+    --config 'build.rustflags=["-C", "link-arg=-Wl,--build-id=none", "-C", "codegen-units=1"]'
+
+# ============================================================
+# Stage 1: Builder (Alibaba Cloud Linux 3)
+# ============================================================
+FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest AS builder-alibaba
+
+RUN yum install -y \
+    gcc gcc-c++ make cmake \
+    openssl-devel protobuf-compiler \
+    libtdx-attest-devel tpm2-tss-devel \
+    libsgx-dcap-quote-verify-devel \
+    git curl pkg-config \
+    && yum clean all
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY rust-toolchain.toml .
+RUN rustup show
+
+COPY Cargo.toml Cargo.lock ./
+COPY proto/ proto/
+COPY build.rs .
+COPY src/ src/
+
+# Build with TDX feature for Alibaba target
+ENV SOURCE_DATE_EPOCH=0
+RUN cargo build --release --features tdx \
+    --config 'build.rustflags=["-C", "link-arg=-Wl,--build-id=none", "-C", "codegen-units=1"]'
+
+# ============================================================
+# Stage 2: Runtime (choose based on TARGET)
+# ============================================================
+FROM amazonlinux:2023 AS runtime-aws
+RUN dnf install -y openssl docker && dnf clean all
+
+FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest AS runtime-alibaba
+RUN yum install -y openssl docker libtdx-attest tpm2-tss && yum clean all
+
+# ============================================================
+# Stage 3: Final image
+# ============================================================
+FROM runtime-${TARGET} AS final
+
+COPY --from=builder-${TARGET} /build/target/release/tapp-server /usr/local/bin/tapp-server
+COPY --from=builder-${TARGET} /build/target/release/tapp-cli /usr/local/bin/tapp-cli
+
+RUN mkdir -p /etc/tapp /var/lib/tapp/apps /var/log/tapp
+
+EXPOSE 50051
+
+ENTRYPOINT ["tapp-server"]
+CMD ["--config", "/etc/tapp/config.toml"]
