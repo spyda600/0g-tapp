@@ -6,7 +6,7 @@ use tapp_service::{
 };
 use tonic::transport::Server;
 use tower::ServiceBuilder;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "tapp-server")]
