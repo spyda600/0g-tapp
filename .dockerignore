@@ -25,4 +25,6 @@ LICENSE
 
 # CI/CD
 .github/
-scripts/
+
+# Keep scripts/ (needed for enclave-init.sh)
+# Keep examples/ (needed for config-enclave.toml)
