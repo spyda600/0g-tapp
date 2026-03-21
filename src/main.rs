@@ -99,10 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Step 6: Initialize TEE Provider (replaces AttestationAgent init)
-    let tee_provider = match create_tee_provider(&config) {
+    let tee_provider: Arc<Box<dyn tapp_service::tee::TeeProvider>> = match create_tee_provider(&config) {
         Ok(provider) => {
             info!("TEE provider created: {}", provider.tee_type());
-            Arc::from(provider)
+            Arc::new(provider)
         }
         Err(e) => {
             error!("Failed to create TEE provider: {}", e);
