@@ -8,3 +8,4 @@ examples/nginx
 verifier/output
 verifier/input
 config/*
+.claude/worktrees/
