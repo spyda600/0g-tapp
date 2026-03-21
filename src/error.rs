@@ -170,9 +170,15 @@ impl From<TappError> for tonic::Status {
                 crate::tee::TeeError::NotAvailable => {
                     Status::failed_precondition("TEE hardware not available")
                 }
-                _ => Status::internal(err.to_string()),
+                _ => {
+                    tracing::error!("TEE error (internal): {}", err);
+                    Status::internal("TEE operation failed")
+                }
             },
-            _ => Status::internal(err.to_string()),
+            _ => {
+                tracing::error!("Internal error: {}", err);
+                Status::internal("Internal service error")
+            }
         }
     }
 }

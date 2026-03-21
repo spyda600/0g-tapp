@@ -305,7 +305,7 @@ fn validate_signature(
             event = "AUTH_SIGNATURE_RECOVERY_FAILED",
             "Failed to recover signer address"
         );
-        Status::unauthenticated(format!("Invalid signature: {}", e))
+        Status::unauthenticated("Invalid signature")
     })?;
 
     debug!(
