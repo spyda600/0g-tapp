@@ -34,7 +34,14 @@ impl MeasurementService {
             _ => 2,
         };
 
-        let measurement_data = format!("{}:{}:{}", ZGEL_DOMAIN, operation_name, data);
+        // Use length-prefixed format to prevent collision attacks.
+        // Without length prefixes, "op:a" + data "b:c" collides with "op:a:b" + data "c".
+        let measurement_data = format!(
+            "{}:{}:{}:{}:{}",
+            ZGEL_DOMAIN.len(), ZGEL_DOMAIN,
+            operation_name.len(), operation_name,
+            data
+        );
         self.provider
             .extend_measurement(register, measurement_data.as_bytes())
             .await
