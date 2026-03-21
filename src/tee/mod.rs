@@ -15,3 +15,8 @@ pub use simulation::SimulationProvider;
 pub mod nitro;
 #[cfg(feature = "nitro")]
 pub use nitro::NitroProvider;
+
+#[cfg(feature = "tdx")]
+pub mod tdx;
+#[cfg(feature = "tdx")]
+pub use tdx::TdxProvider;
