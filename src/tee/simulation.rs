@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine;
 use sha2::{Digest, Sha384};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
