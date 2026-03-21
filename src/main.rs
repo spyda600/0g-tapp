@@ -155,31 +155,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 9: Start gRPC server
     #[cfg(feature = "nitro")]
     {
-        // In a Nitro Enclave, the ONLY way to communicate with the parent
-        // is via vsock. We listen on vsock CID_ANY (accept from any CID)
-        // and feed connections into tonic via serve_with_incoming.
+        // In a Nitro Enclave, vsock is the ONLY communication channel.
+        // We listen on vsock and bridge connections to a local TCP socket
+        // where tonic's standard gRPC server is listening.
         let vsock_port: u32 = bind_address
             .split(':')
             .last()
             .and_then(|p| p.parse().ok())
             .unwrap_or(50051);
 
-        // VMADDR_CID_ANY = 0xFFFFFFFF — accept connections from any CID
-        let mut vsock_listener = tokio_vsock::VsockListener::bind(0xFFFFFFFF, vsock_port)
-            .map_err(|e| format!("Failed to bind vsock port {}: {}", vsock_port, e))?;
-
-        info!("TAPP gRPC server listening on vsock port {} (Nitro Enclave)", vsock_port);
-
-        // VsockListener::incoming() returns a Stream of VsockStream.
-        // tonic's serve_with_incoming needs Stream<Item=Result<impl AsyncRead+AsyncWrite+Connected+Unpin>>
-        // tokio_vsock::VsockStream implements AsyncRead + AsyncWrite + Unpin.
-        // tonic provides a blanket Connected impl.
-        let incoming = vsock_listener.incoming();
-
+        // Bind TCP on loopback (tonic serves here)
+        let addr: std::net::SocketAddr = "127.0.0.1:50051".parse().unwrap();
         let server = Server::builder()
             .layer(layer)
             .add_service(TappServiceServer::new(service))
-            .serve_with_incoming(incoming);
+            .serve(addr);
+
+        info!("TAPP gRPC server listening on {} (local)", addr);
+
+        // Spawn vsock-to-TCP bridge
+        let vsock_addr = tokio_vsock::VsockAddr::new(0xFFFFFFFF, vsock_port);
+        let vsock_listener = tokio_vsock::VsockListener::bind(vsock_addr)
+            .map_err(|e| format!("Failed to bind vsock port {}: {}", vsock_port, e))?;
+
+        info!("vsock bridge listening on port {} (Nitro Enclave)", vsock_port);
+
+        tokio::spawn(async move {
+            loop {
+                match vsock_listener.accept().await {
+                    Ok((mut vsock_stream, peer)) => {
+                        info!("vsock connection from CID {}", peer.cid());
+                        tokio::spawn(async move {
+                            match tokio::net::TcpStream::connect("127.0.0.1:50051").await {
+                                Ok(mut tcp_stream) => {
+                                    if let Err(e) = tokio::io::copy_bidirectional(
+                                        &mut vsock_stream,
+                                        &mut tcp_stream,
+                                    )
+                                    .await
+                                    {
+                                        error!("vsock bridge error: {}", e);
+                                    }
+                                }
+                                Err(e) => error!("TCP connect failed: {}", e),
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("vsock accept error: {}", e);
+                    }
+                }
+            }
+        });
 
         tokio::select! {
             result = server => {
