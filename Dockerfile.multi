@@ -13,7 +13,7 @@ ARG TARGET=aws
 # ============================================================
 FROM amazonlinux:2023 AS builder-aws
 
-RUN dnf install -y \
+RUN dnf install -y --allowerasing \
     gcc gcc-c++ make cmake \
     openssl-devel protobuf-compiler \
     git curl pkg-config \
