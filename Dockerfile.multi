@@ -71,7 +71,7 @@ RUN cargo build --release --features tdx \
 # Stage 2: Runtime images
 # ============================================================
 FROM amazonlinux:2023 AS runtime-aws
-RUN dnf install -y --allowerasing openssl iproute shadow-utils && dnf clean all && \
+RUN dnf install -y --allowerasing openssl iproute shadow-utils util-linux && dnf clean all && \
     adduser --system --no-create-home tapp
 COPY --from=builder-aws /build/target/release/tapp-server /usr/local/bin/tapp-server
 COPY --from=builder-aws /build/target/release/tapp-cli /usr/local/bin/tapp-cli
