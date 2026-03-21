@@ -11,8 +11,5 @@ max_connections = 1000
 request_timeout_seconds = 30
 tls_enabled = false
 
-[server.permission]
-enabled = false
-
 [boot]
 tee_type = "nitro"

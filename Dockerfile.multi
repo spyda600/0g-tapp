@@ -75,6 +75,8 @@ RUN dnf install -y openssl && dnf clean all
 COPY --from=builder-aws /build/target/release/tapp-server /usr/local/bin/tapp-server
 COPY --from=builder-aws /build/target/release/tapp-cli /usr/local/bin/tapp-cli
 COPY examples/config-enclave.toml /etc/tapp/config.toml
+COPY scripts/enclave-init.sh /usr/local/bin/enclave-init.sh
+RUN chmod +x /usr/local/bin/enclave-init.sh
 
 FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest AS runtime-alibaba
 RUN yum install -y openssl docker libtdx-attest tpm2-tss && yum clean all
@@ -90,5 +92,4 @@ RUN mkdir -p /etc/tapp /var/lib/tapp/apps /var/log/tapp
 
 EXPOSE 50051
 
-ENTRYPOINT ["tapp-server"]
-CMD ["--config", "/etc/tapp/config.toml"]
+ENTRYPOINT ["/usr/local/bin/enclave-init.sh"]
