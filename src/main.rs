@@ -1,10 +1,9 @@
-use attestation_agent::AttestationAgent;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tapp_service::{
     auth_layer::AuthLayer, config::TappConfig, init_tracing, permission::PermissionManager,
-    TappServiceImpl, TappServiceServer, VERSION,
+    tee::create_tee_provider, TappServiceImpl, TappServiceServer, VERSION,
 };
 use tonic::transport::Server;
 use tower::ServiceBuilder;
@@ -104,23 +103,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Step 6: Initialize AttestationAgent and MeasurementService
-    // Ensure AA config file exists
-    if let Some(ref aa_config_path) = config.boot.aa_config_path {
-        tapp_service::boot::BootService::ensure_aa_config(aa_config_path)
-            .expect("Failed to ensure AA config");
-    }
-    let mut aa = AttestationAgent::new(config.boot.aa_config_path.as_deref())
-        .expect("Failed to create AttestationAgent");
-    aa.init()
-        .await
-        .expect("Failed to initialize AttestationAgent");
+    // Step 6: Initialize TEE Provider (replaces AttestationAgent init)
+    let tee_provider = match create_tee_provider(&config) {
+        Ok(provider) => {
+            info!("TEE provider created: {}", provider.tee_type());
+            Arc::from(provider)
+        }
+        Err(e) => {
+            error!("Failed to create TEE provider: {}", e);
+            error!("Hint: Run with --features simulation for development without TEE hardware");
+            std::process::exit(1);
+        }
+    };
 
-    let measurement_service = Arc::new(tapp_service::measurement_service::MeasurementService::new(
-        Arc::new(tokio::sync::Mutex::new(aa)),
-    ));
+    if let Err(e) = tee_provider.init().await {
+        error!("Failed to initialize TEE provider: {}", e);
+        error!("Hint: Ensure TEE hardware is available, or use --features simulation");
+        std::process::exit(1);
+    }
+
+    let measurement_service = Arc::new(
+        tapp_service::measurement_service::MeasurementService::new(tee_provider.clone()),
+    );
     info!(
-        "✓ Detected TEE type: {:?}",
+        "✓ Detected TEE type: {}",
         measurement_service.get_tee_type().await
     );
 
