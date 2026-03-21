@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use super::{TeeError, TeeType, AttestationEvidence, MeasurementRegister};
+
+use super::error::TeeError;
+use super::types::{AttestationEvidence, MeasurementRegister, TeeType};
 
 /// Core trait that all TEE backends must implement.
 ///
@@ -18,6 +20,7 @@ pub trait TeeProvider: Send + Sync + 'static {
     async fn get_evidence(&self, runtime_data: &[u8]) -> Result<AttestationEvidence, TeeError>;
 
     /// Extend a runtime measurement register.
+    /// Semantics: register = SHA384(register || data)
     async fn extend_measurement(
         &self,
         register_index: u32,

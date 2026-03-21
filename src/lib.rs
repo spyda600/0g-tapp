@@ -1,4 +1,5 @@
 pub mod app_key;
+pub mod tee;
 pub mod auth_layer;
 pub mod balance_withdrawal;
 pub mod boot;

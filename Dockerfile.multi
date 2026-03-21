@@ -2,11 +2,14 @@
 # Usage:
 #   docker build --build-arg TARGET=aws -f Dockerfile.multi .
 #   docker build --build-arg TARGET=alibaba -f Dockerfile.multi .
+#
+# Note: Uses separate Dockerfile stages per target to avoid
+# Docker BuildKit ARG interpolation issues with COPY --from.
 
 ARG TARGET=aws
 
 # ============================================================
-# Stage 1: Builder (Amazon Linux 2023)
+# Stage 1a: Builder (Amazon Linux 2023)
 # ============================================================
 FROM amazonlinux:2023 AS builder-aws
 
@@ -29,14 +32,13 @@ COPY proto/ proto/
 COPY build.rs .
 COPY src/ src/
 
-# Build with Nitro feature for AWS target
-# Reproducible build flags
+# Build with nitro feature for AWS target
 ENV SOURCE_DATE_EPOCH=0
-RUN cargo build --release --features simulation \
+RUN cargo build --release --features nitro \
     --config 'build.rustflags=["-C", "link-arg=-Wl,--build-id=none", "-C", "codegen-units=1"]'
 
 # ============================================================
-# Stage 1: Builder (Alibaba Cloud Linux 3)
+# Stage 1b: Builder (Alibaba Cloud Linux 3)
 # ============================================================
 FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest AS builder-alibaba
 
@@ -48,7 +50,6 @@ RUN yum install -y \
     git curl pkg-config \
     && yum clean all
 
-# Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -67,21 +68,22 @@ RUN cargo build --release --features tdx \
     --config 'build.rustflags=["-C", "link-arg=-Wl,--build-id=none", "-C", "codegen-units=1"]'
 
 # ============================================================
-# Stage 2: Runtime (choose based on TARGET)
+# Stage 2: Runtime images
 # ============================================================
 FROM amazonlinux:2023 AS runtime-aws
 RUN dnf install -y openssl docker && dnf clean all
+COPY --from=builder-aws /build/target/release/tapp-server /usr/local/bin/tapp-server
+COPY --from=builder-aws /build/target/release/tapp-cli /usr/local/bin/tapp-cli
 
 FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest AS runtime-alibaba
 RUN yum install -y openssl docker libtdx-attest tpm2-tss && yum clean all
+COPY --from=builder-alibaba /build/target/release/tapp-server /usr/local/bin/tapp-server
+COPY --from=builder-alibaba /build/target/release/tapp-cli /usr/local/bin/tapp-cli
 
 # ============================================================
-# Stage 3: Final image
+# Stage 3: Final image (selected by TARGET arg)
 # ============================================================
 FROM runtime-${TARGET} AS final
-
-COPY --from=builder-${TARGET} /build/target/release/tapp-server /usr/local/bin/tapp-server
-COPY --from=builder-${TARGET} /build/target/release/tapp-cli /usr/local/bin/tapp-cli
 
 RUN mkdir -p /etc/tapp /var/lib/tapp/apps /var/log/tapp
 
