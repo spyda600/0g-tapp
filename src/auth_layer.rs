@@ -220,7 +220,11 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "StartService" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
-        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" | "DockerLogin"
+        // WithdrawBalance is OwnerOnly — moves real funds, must not be
+        // accessible to whitelisted users
+        "WithdrawBalance" => MethodPermission::OwnerOnly,
+
+        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "DockerLogin"
         | "DockerLogout" | "PruneImages" => MethodPermission::Whitelist,
 
         // Default: require owner permission
