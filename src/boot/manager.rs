@@ -48,8 +48,14 @@ pub struct DeploymentResult {
 }
 
 impl DockerComposeManager {
-    /// Get the directory path for an app
+    /// Get the directory path for an app.
+    /// Validates app_id to prevent path traversal attacks.
     pub fn get_app_dir(app_id: &str) -> PathBuf {
+        // Reject path traversal attempts
+        assert!(
+            !app_id.contains("..") && !app_id.contains('/') && !app_id.contains('\\') && !app_id.is_empty(),
+            "Invalid app_id: must not contain path separators or be empty"
+        );
         PathBuf::from(format!("/var/lib/tapp/apps/{}", app_id))
     }
 

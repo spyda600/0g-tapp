@@ -11,9 +11,18 @@ pub async fn withdraw_balance(
     chain_id: u64,
     recipient: &str,
 ) -> Result<WithdrawResult> {
-    // Validate RPC URL
+    // Validate RPC URL — reject internal/metadata URLs (SSRF prevention)
     if rpc_url.is_empty() || (!rpc_url.starts_with("http://") && !rpc_url.starts_with("https://")) {
-        return Err(anyhow!("Invalid RPC URL"));
+        return Err(anyhow!("Invalid RPC URL: must be http:// or https://"));
+    }
+    let url_lower = rpc_url.to_lowercase();
+    if url_lower.contains("169.254.") || url_lower.contains("localhost")
+        || url_lower.contains("127.0.0.") || url_lower.contains("[::1]")
+        || url_lower.contains("0.0.0.0") || url_lower.contains("metadata")
+        || url_lower.contains("10.") || url_lower.contains("172.16.")
+        || url_lower.contains("192.168.")
+    {
+        return Err(anyhow!("Invalid RPC URL: internal/private addresses not allowed"));
     }
 
     // Create provider
