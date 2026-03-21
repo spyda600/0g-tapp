@@ -37,9 +37,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config
         }
         Err(e) => {
-            println!("⚠ Failed to load config from {}: {}", args.config, e);
-            println!("Using default configuration");
-            TappConfig::default()
+            // Fail-closed: do NOT fall back to insecure defaults.
+            // Default config has auth disabled and TLS off.
+            eprintln!("FATAL: Failed to load config from {}: {}", args.config, e);
+            eprintln!("Refusing to start with default configuration (fail-closed).");
+            std::process::exit(1);
         }
     };
 
