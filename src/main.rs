@@ -175,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Spawn vsock-to-TCP bridge
         let vsock_addr = tokio_vsock::VsockAddr::new(0xFFFFFFFF, vsock_port);
-        let vsock_listener = tokio_vsock::VsockListener::bind(vsock_addr)
+        let mut vsock_listener = tokio_vsock::VsockListener::bind(vsock_addr)
             .map_err(|e| format!("Failed to bind vsock port {}: {}", vsock_port, e))?;
 
         info!("vsock bridge listening on port {} (Nitro Enclave)", vsock_port);
