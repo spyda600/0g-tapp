@@ -10,3 +10,8 @@ pub use types::*;
 pub mod simulation;
 #[cfg(feature = "simulation")]
 pub use simulation::SimulationProvider;
+
+#[cfg(feature = "nitro")]
+pub mod nitro;
+#[cfg(feature = "nitro")]
+pub use nitro::NitroProvider;
