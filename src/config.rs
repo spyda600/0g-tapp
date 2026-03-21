@@ -15,6 +15,11 @@ pub struct BootServiceConfig {
     /// Attestation agent configuration
     #[serde(default)]
     pub aa_config_path: Option<String>,
+
+    /// TEE provider type: "tdx", "nitro", or "simulation"
+    /// If not specified, auto-detected from feature flags.
+    #[serde(default)]
+    pub tee_type: Option<String>,
 }
 
 /// Logging configuration
@@ -239,6 +244,7 @@ impl Default for BootServiceConfig {
     fn default() -> Self {
         Self {
             aa_config_path: Some("config/attestation-agent.toml".to_string()),
+            tee_type: None,
         }
     }
 }

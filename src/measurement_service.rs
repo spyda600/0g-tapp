@@ -1,7 +1,6 @@
 use crate::error::TappResult;
-use attestation_agent::{AttestationAPIs, AttestationAgent};
+use crate::tee::TeeProvider;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::info;
 
 pub const ZGEL_DOMAIN: &str = "tapp.0g.com";
@@ -19,25 +18,31 @@ pub const OPERATION_NAME_STOP_SERVICE: &str = "stop_service";
 pub const OPERATION_NAME_START_SERVICE: &str = "start_service";
 
 pub struct MeasurementService {
-    aa: Arc<Mutex<AttestationAgent>>,
+    provider: Arc<dyn TeeProvider>,
 }
 
 impl MeasurementService {
-    pub fn new(aa: Arc<Mutex<AttestationAgent>>) -> Self {
-        Self { aa }
+    pub fn new(provider: Arc<dyn TeeProvider>) -> Self {
+        Self { provider }
     }
 
     /// Extend runtime measurement for any operation
     pub async fn extend_measurement(&self, operation_name: &str, data: &str) -> TappResult<()> {
-        self.aa
-            .lock()
+        // Use register 2 for most operations, register 3 for key/balance operations
+        let register = match operation_name {
+            "get_app_secret_key" | "withdraw_balance" => 3,
+            _ => 2,
+        };
+
+        let measurement_data = format!("{}:{}:{}", ZGEL_DOMAIN, operation_name, data);
+        self.provider
+            .extend_measurement(register, measurement_data.as_bytes())
             .await
-            .extend_runtime_measurement(ZGEL_DOMAIN, operation_name, data, None)
-            .await?;
+            .map_err(|e| crate::error::TappError::Internal(format!("Measurement failed: {}", e)))?;
 
         info!(
             operation = %operation_name,
-            data = ?data,
+            register = register,
             "Runtime measurement extended"
         );
 
@@ -46,12 +51,18 @@ impl MeasurementService {
 
     /// Get TEE type
     pub async fn get_tee_type(&self) -> String {
-        format!("{:?}", self.aa.lock().await.get_tee_type())
+        self.provider.tee_type().to_string()
     }
 
     /// Get evidence
     pub async fn get_evidence(&self, report_data: &[u8]) -> TappResult<Vec<u8>> {
-        let evidence = self.aa.lock().await.get_evidence(report_data).await?;
-        Ok(evidence)
+        let evidence = self
+            .provider
+            .get_evidence(report_data)
+            .await
+            .map_err(|e| {
+                crate::error::TappError::Internal(format!("Evidence generation failed: {}", e))
+            })?;
+        Ok(evidence.raw)
     }
 }

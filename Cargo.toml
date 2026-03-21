@@ -29,7 +29,7 @@ attestation-agent = { git = "https://github.com/inclavare-containers/guest-compo
     "snp-attester",
     "cca-attester",
     "csv-attester",
-] }
+], optional = true }
 # resource_uri = { git = "https://github.com/inclavare-containers/guest-components" }
 # kbs-types = { git = "https://github.com/inclavare-containers/kbs-types.git", rev = "5c029c9" }
 
@@ -90,6 +90,12 @@ rand = "0.8.5"
 tower = "0.4"
 http = "1.0"
 hyper = "1.0"
+
+[features]
+default = ["tdx"]
+tdx = ["dep:attestation-agent"]
+nitro = []
+simulation = []
 
 [build-dependencies]
 tonic-build = "0.12"

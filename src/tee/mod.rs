@@ -1,8 +1,10 @@
 pub mod error;
+pub mod factory;
 pub mod provider;
 pub mod types;
 
 pub use error::TeeError;
+pub use factory::create_tee_provider;
 pub use provider::TeeProvider;
 pub use types::*;
 
