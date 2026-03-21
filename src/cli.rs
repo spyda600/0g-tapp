@@ -1,3 +1,4 @@
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tapp_service::proto::{
@@ -757,7 +758,7 @@ async fn get_evidence(server: &str, app_id: String) -> Result<(), Box<dyn std::e
     println!("✓ Evidence generated successfully");
     println!("  TEE Type: {}", result.tee_type);
     println!("  Evidence (hex): {}", hex::encode(&result.evidence));
-    println!("  Evidence (base64): {}", base64::encode(&result.evidence));
+    println!("  Evidence (base64): {}", base64::engine::general_purpose::STANDARD.encode(&result.evidence));
 
     Ok(())
 }
@@ -1288,7 +1289,7 @@ fn sign_message(
     println!("✓ Message signed");
     println!("  Message: {}", message);
     println!("  Signature (hex): 0x{}", hex::encode(&signature));
-    println!("  Signature (base64): {}", base64::encode(&signature));
+    println!("  Signature (base64): {}", base64::engine::general_purpose::STANDARD.encode(&signature));
 
     Ok(())
 }
