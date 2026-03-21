@@ -183,10 +183,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("vsock bridge listening on port {} (Nitro Enclave)", vsock_port);
 
         // Connection limiter: max concurrent bridged connections
-        let max_connections = config.server.max_connections.unwrap_or(200) as usize;
+        let max_connections = config.server.max_connections;
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
         // Per-connection timeout (seconds)
-        let conn_timeout_secs = config.server.request_timeout_seconds.unwrap_or(300) as u64;
+        let conn_timeout_secs = config.server.request_timeout_seconds;
         // Expected parent CID (only the parent EC2 instance should connect)
         const EXPECTED_PARENT_CID: u32 = 3;
 
