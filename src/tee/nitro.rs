@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha384};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{AttestationEvidence, MeasurementRegister, TeeError, TeeProvider, TeeType};
 
@@ -95,6 +95,67 @@ impl NitroProvider {
     }
 }
 
+impl NitroProvider {
+    /// Generate an attestation document via the Nitro Security Module (NSM).
+    ///
+    /// The NSM hardware signs a COSE Sign1 document containing:
+    /// - PCR0-PCR8: static enclave image measurements (set at launch)
+    /// - user_data: our MeasurementAccumulator output (runtime measurements)
+    /// - nonce: the caller's challenge (runtime_data)
+    ///
+    /// Returns the raw CBOR-encoded attestation document bytes.
+    fn nsm_get_attestation_doc(user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
+        use aws_nitro_enclaves_nsm_api::api::Request;
+        use aws_nitro_enclaves_nsm_api::driver as nsm_driver;
+
+        let nsm_fd = nsm_driver::nsm_init();
+        if nsm_fd < 0 {
+            return Err(TeeError::AttestationFailed(
+                "Failed to open NSM device".to_string(),
+            ));
+        }
+
+        let request = Request::Attestation {
+            user_data: if user_data.is_empty() {
+                None
+            } else {
+                Some(user_data.into())
+            },
+            nonce: if nonce.is_empty() {
+                None
+            } else {
+                Some(nonce.into())
+            },
+            public_key: None,
+        };
+
+        let response = nsm_driver::nsm_process_request(nsm_fd, request);
+
+        // Close the NSM fd
+        nsm_driver::nsm_exit(nsm_fd);
+
+        match response {
+            aws_nitro_enclaves_nsm_api::api::Response::Attestation { document } => {
+                info!(
+                    doc_len = document.len(),
+                    "NSM attestation document generated"
+                );
+                Ok(document)
+            }
+            aws_nitro_enclaves_nsm_api::api::Response::Error(err) => {
+                Err(TeeError::AttestationFailed(format!(
+                    "NSM attestation failed: {:?}",
+                    err
+                )))
+            }
+            other => Err(TeeError::AttestationFailed(format!(
+                "Unexpected NSM response: {:?}",
+                other
+            ))),
+        }
+    }
+}
+
 impl Default for NitroProvider {
     fn default() -> Self {
         Self::new()
@@ -132,43 +193,14 @@ impl TeeProvider for NitroProvider {
             TeeError::AttestationFailed(format!("Failed to lock accumulator: {}", e))
         })?;
         let user_data = acc.to_user_data();
-        // Lock is held until end of this block.
-
-        // In production, this would call the NSM API:
-        //   let nsm_fd = nsm_driver::nsm_init();
-        //   let request = nsm_driver::Request::Attestation {
-        //       user_data: Some(user_data),
-        //       nonce: Some(runtime_data.to_vec()),
-        //       public_key: None,
-        //   };
-        //   let response = nsm_driver::nsm_process_request(nsm_fd, request);
-        //
-        // The NSM hardware signs the attestation doc (including user_data
-        // and nonce), cryptographically binding both measurements and
-        // the challenge nonce to the enclave identity.
+        drop(acc);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Placeholder attestation — NOT cryptographically bound.
-        // TODO: Replace with real NSM API call when deploying to Nitro hardware.
-        let placeholder = serde_json::json!({
-            "provider": "nitro",
-            "placeholder": true,
-            "note": "NSM attestation requires running inside a Nitro Enclave. This is NOT a real attestation document.",
-            "user_data": hex::encode(&user_data),
-            "nonce": hex::encode(runtime_data),
-            "timestamp": timestamp,
-        });
-
-        // Drop accumulator lock before serialization
-        drop(acc);
-
-        let raw = serde_json::to_vec(&placeholder).map_err(|e| {
-            TeeError::AttestationFailed(format!("Serialization failed: {}", e))
-        })?;
+        let raw = Self::nsm_get_attestation_doc(&user_data, runtime_data)?;
 
         Ok(AttestationEvidence {
             raw,

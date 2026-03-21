@@ -1,0 +1,18 @@
+# TAPP Service Configuration for Nitro Enclave deployment
+# This config is baked into the EIF at /etc/tapp/config.toml
+
+[logging]
+level = "info"
+format = "json"
+
+[server]
+bind_address = "0.0.0.0:50051"
+max_connections = 1000
+request_timeout_seconds = 30
+tls_enabled = false
+
+[server.permission]
+enabled = false
+
+[boot]
+tee_type = "nitro"

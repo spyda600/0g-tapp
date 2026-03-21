@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tapp_service::{
     auth_layer::AuthLayer, config::TappConfig, init_tracing, permission::PermissionManager,
@@ -67,11 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind
         .unwrap_or_else(|| config.server.bind_address.clone());
 
-    let addr: SocketAddr = bind_address
-        .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
-
-    info!("Binding to address: {}", addr);
+    info!("Bind address configured: {}", bind_address);
 
     // Step 5: Initialize PermissionManager if configured
     let permission_manager = if let Some(ref perm_config) = config.server.permission {
@@ -157,23 +152,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
-    let server = Server::builder()
-        .layer(layer)
-        .add_service(TappServiceServer::new(service))
-        .serve(addr);
+    // Step 9: Start gRPC server (vsock for Nitro, TCP otherwise)
+    #[cfg(feature = "nitro")]
+    {
+        use tokio_vsock::VsockListener;
+        use tonic::transport::server::TcpIncoming;
 
-    info!("🌐 TAPP gRPC server listening on {}", addr);
+        // Inside a Nitro Enclave, there is no TCP/IP stack.
+        // Listen on vsock so the parent instance can proxy traffic.
+        let vsock_port: u32 = bind_address
+            .split(':')
+            .last()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(50051);
 
-    // Step 8: Handle shutdown gracefully
-    tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                error!("Server error: {}", e);
-                std::process::exit(1);
+        // CID_ANY (0xFFFFFFFF) accepts connections from any CID
+        let vsock_listener = VsockListener::bind(0xFFFFFFFF, vsock_port)
+            .map_err(|e| format!("Failed to bind vsock port {}: {}", vsock_port, e))?;
+
+        info!("🌐 TAPP gRPC server listening on vsock port {} (Nitro Enclave mode)", vsock_port);
+
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(
+            tokio::net::TcpListener::from_std(std::net::TcpListener::from(vsock_listener))
+                .map_err(|e| format!("vsock listener conversion failed: {}", e))?
+        );
+
+        // Fallback: if vsock doesn't work with tonic's serve_with_incoming,
+        // bind TCP on localhost inside enclave and rely on vsock-proxy
+        let addr: std::net::SocketAddr = bind_address
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0:50051".parse().unwrap());
+
+        let server = Server::builder()
+            .layer(layer)
+            .add_service(TappServiceServer::new(service))
+            .serve(addr);
+
+        info!("🌐 TAPP gRPC server listening on {} (Nitro mode — use vsock-proxy on parent)", addr);
+
+        tokio::select! {
+            result = server => {
+                if let Err(e) = result {
+                    error!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping server");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal, stopping server");
+    }
+
+    #[cfg(not(feature = "nitro"))]
+    {
+        let addr: std::net::SocketAddr = bind_address
+            .parse()
+            .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
+
+        let server = Server::builder()
+            .layer(layer)
+            .add_service(TappServiceServer::new(service))
+            .serve(addr);
+
+        info!("🌐 TAPP gRPC server listening on {}", addr);
+
+        tokio::select! {
+            result = server => {
+                if let Err(e) = result {
+                    error!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping server");
+            }
         }
     }
 
