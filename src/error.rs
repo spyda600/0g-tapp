@@ -46,6 +46,10 @@ pub enum TappError {
     #[error("Service unavailable: {service}")]
     ServiceUnavailable { service: String },
 
+    /// TEE provider errors
+    #[error("TEE error: {0}")]
+    Tee(#[from] crate::tee::TeeError),
+
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -162,6 +166,12 @@ impl From<TappError> for tonic::Status {
                 Status::not_found(format!("Service not found: {}", service_name))
             }
             TappError::Config(_) => Status::failed_precondition("Service configuration error"),
+            TappError::Tee(ref e) => match e {
+                crate::tee::TeeError::NotAvailable => {
+                    Status::failed_precondition("TEE hardware not available")
+                }
+                _ => Status::internal(err.to_string()),
+            },
             _ => Status::internal(err.to_string()),
         }
     }

@@ -10,6 +10,7 @@ pub mod permission;
 pub mod service_monitor;
 pub mod signature_auth;
 pub mod task_manager;
+pub mod tee;
 pub mod utils;
 pub use boot::BootService;
 pub use config::TappConfig;
