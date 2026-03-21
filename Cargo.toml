@@ -19,6 +19,7 @@ tokio = { version = "1.0", features = [
 ] }
 tokio-stream = "0.1"
 async-recursion = "1.0"
+async-trait = "0.1"
 
 # Attestation
 # attester = { git = "https://github.com/inclavare-containers/guest-components" }
@@ -95,6 +96,9 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[features]
+simulation = []
 
 [[bin]]
 name = "tapp-server"
