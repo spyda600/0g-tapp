@@ -153,32 +153,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();
 
     // Step 9: Start gRPC server
-    // Note: In Nitro Enclave mode, the enclave has a loopback interface.
-    // The parent EC2 instance runs vsock-proxy to bridge external TCP
-    // traffic to the enclave's vsock, which maps to localhost inside.
-    let addr: std::net::SocketAddr = bind_address
-        .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
-
-    let server = Server::builder()
-        .layer(layer)
-        .add_service(TappServiceServer::new(service))
-        .serve(addr);
-
     #[cfg(feature = "nitro")]
-    info!("TAPP gRPC server listening on {} (Nitro Enclave — use vsock-proxy on parent)", addr);
-    #[cfg(not(feature = "nitro"))]
-    info!("TAPP gRPC server listening on {}", addr);
+    {
+        // In a Nitro Enclave, the ONLY way to communicate with the parent
+        // is via vsock. We listen on vsock CID_ANY (accept from any CID)
+        // and feed connections into tonic via serve_with_incoming.
+        let vsock_port: u32 = bind_address
+            .split(':')
+            .last()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(50051);
 
-    tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                error!("Server error: {}", e);
-                std::process::exit(1);
+        // VMADDR_CID_ANY = 0xFFFFFFFF — accept connections from any CID
+        let mut vsock_listener = tokio_vsock::VsockListener::bind(0xFFFFFFFF, vsock_port)
+            .map_err(|e| format!("Failed to bind vsock port {}: {}", vsock_port, e))?;
+
+        info!("TAPP gRPC server listening on vsock port {} (Nitro Enclave)", vsock_port);
+
+        // VsockListener::incoming() returns a Stream of VsockStream.
+        // tonic's serve_with_incoming needs Stream<Item=Result<impl AsyncRead+AsyncWrite+Connected+Unpin>>
+        // tokio_vsock::VsockStream implements AsyncRead + AsyncWrite + Unpin.
+        // tonic provides a blanket Connected impl.
+        let incoming = vsock_listener.incoming();
+
+        let server = Server::builder()
+            .layer(layer)
+            .add_service(TappServiceServer::new(service))
+            .serve_with_incoming(incoming);
+
+        tokio::select! {
+            result = server => {
+                if let Err(e) = result {
+                    error!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping server");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal, stopping server");
+    }
+
+    #[cfg(not(feature = "nitro"))]
+    {
+        let addr: std::net::SocketAddr = bind_address
+            .parse()
+            .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
+
+        let server = Server::builder()
+            .layer(layer)
+            .add_service(TappServiceServer::new(service))
+            .serve(addr);
+
+        info!("TAPP gRPC server listening on {}", addr);
+
+        tokio::select! {
+            result = server => {
+                if let Err(e) = result {
+                    error!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, stopping server");
+            }
         }
     }
 
