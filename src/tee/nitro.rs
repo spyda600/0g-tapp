@@ -57,6 +57,12 @@ impl MeasurementAccumulator {
         for reg in &self.registers {
             out.extend_from_slice(reg);
         }
+        // NSM user_data field has a 512-byte hard limit
+        assert!(
+            out.len() <= 512,
+            "user_data exceeds NSM 512-byte limit: {} bytes",
+            out.len()
+        );
         out
     }
 
@@ -88,7 +94,10 @@ pub struct NitroProvider {
 }
 
 impl NitroProvider {
-    pub fn new() -> Self {
+    /// Create a new Nitro provider. Restricted to crate-internal use
+    /// to prevent external code from constructing fresh instances
+    /// (which would reset the measurement accumulator).
+    pub(crate) fn new() -> Self {
         Self {
             accumulator: Mutex::new(MeasurementAccumulator::new()),
         }
@@ -105,6 +114,11 @@ impl NitroProvider {
         use aws_nitro_enclaves_nsm_api::driver;
 
         let nsm_fd = driver::nsm_init();
+        if nsm_fd < 0 {
+            return Err(TeeError::AttestationFailed(
+                "Failed to initialize NSM device".to_string(),
+            ));
+        }
 
         let request = Request::Attestation {
             user_data: if user_data.is_empty() {
@@ -131,14 +145,18 @@ impl NitroProvider {
                 );
                 Ok(document)
             }
-            Response::Error(err) => Err(TeeError::AttestationFailed(format!(
-                "NSM attestation failed: {:?}",
-                err
-            ))),
-            other => Err(TeeError::AttestationFailed(format!(
-                "Unexpected NSM response: {:?}",
-                other
-            ))),
+            Response::Error(err) => {
+                warn!("NSM attestation error (internal): {:?}", err);
+                Err(TeeError::AttestationFailed(
+                    "Attestation document generation failed".to_string(),
+                ))
+            }
+            other => {
+                warn!("Unexpected NSM response (internal): {:?}", other);
+                Err(TeeError::AttestationFailed(
+                    "Attestation document generation failed".to_string(),
+                ))
+            }
         }
     }
 
@@ -183,11 +201,11 @@ impl TeeProvider for NitroProvider {
         // Hold the lock across the entire attestation operation to prevent
         // TOCTOU races where extend_measurement could mutate registers
         // between reading user_data and generating the attestation doc.
+        // The lock is NOT dropped until after nsm_get_attestation_doc returns.
         let acc = self.accumulator.lock().map_err(|e| {
             TeeError::AttestationFailed(format!("Failed to lock accumulator: {}", e))
         })?;
         let user_data = acc.to_user_data();
-        drop(acc);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -195,6 +213,9 @@ impl TeeProvider for NitroProvider {
             .as_secs();
 
         let raw = Self::nsm_get_attestation_doc(&user_data, runtime_data)?;
+
+        // Lock is released here (end of scope for `acc`)
+        drop(acc);
 
         Ok(AttestationEvidence {
             raw,

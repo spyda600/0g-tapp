@@ -1,0 +1,28 @@
+# Secrets and credentials
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+config/*.toml
+!examples/config-enclave.toml
+
+# Build artifacts
+target/
+*.eif
+
+# Git and IDE
+.git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+
+# Documentation
+docs/
+*.md
+LICENSE
+
+# CI/CD
+.github/
+scripts/

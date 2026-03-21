@@ -2,11 +2,24 @@ use super::{TeeError, TeeProvider};
 use crate::config::TappConfig;
 use tracing::{info, warn};
 
+// Compile-time guard: simulation must not be enabled alongside real TEE features.
+// This prevents accidental production builds that could be downgraded to simulation.
+#[cfg(all(feature = "simulation", feature = "nitro"))]
+compile_error!("Cannot enable both 'simulation' and 'nitro' features. Use only one TEE provider per build.");
+
+#[cfg(all(feature = "simulation", feature = "tdx"))]
+compile_error!("Cannot enable both 'simulation' and 'tdx' features. Use only one TEE provider per build.");
+
 /// Create the appropriate TEE provider based on configuration and feature flags.
+///
+/// Provider selection priority (when auto-detecting):
+/// 1. TDX (if compiled with --features tdx)
+/// 2. Nitro (if compiled with --features nitro)
+/// 3. Simulation (if compiled with --features simulation) — development only
 pub fn create_tee_provider(config: &TappConfig) -> Result<Box<dyn TeeProvider>, TeeError> {
     // Check explicit config first
     if let Some(ref tee_type) = config.boot.tee_type {
-        return match tee_type.as_str() {
+        return match tee_type.to_lowercase().as_str() {
             #[cfg(feature = "tdx")]
             "tdx" => {
                 info!("Creating TDX provider (explicit config)");
@@ -20,7 +33,7 @@ pub fn create_tee_provider(config: &TappConfig) -> Result<Box<dyn TeeProvider>, 
             }
             #[cfg(feature = "simulation")]
             "simulation" => {
-                info!("Creating Simulation provider (explicit config)");
+                warn!("Creating Simulation provider (explicit config) — NOT FOR PRODUCTION");
                 Ok(Box::new(super::SimulationProvider::new()))
             }
             other => Err(TeeError::InitializationFailed(format!(
@@ -30,7 +43,7 @@ pub fn create_tee_provider(config: &TappConfig) -> Result<Box<dyn TeeProvider>, 
         };
     }
 
-    // Auto-detect from feature flags
+    // Auto-detect from feature flags (priority: tdx > nitro > simulation)
     #[cfg(feature = "tdx")]
     {
         info!("Auto-selecting TDX provider (feature flag)");

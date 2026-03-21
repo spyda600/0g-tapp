@@ -6,7 +6,7 @@ level = "info"
 format = "json"
 
 [server]
-bind_address = "0.0.0.0:50051"
+bind_address = "127.0.0.1:50051"
 max_connections = 1000
 request_timeout_seconds = 30
 tls_enabled = false

@@ -180,29 +180,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         info!("vsock bridge listening on port {} (Nitro Enclave)", vsock_port);
 
-        tokio::spawn(async move {
+        // Connection limiter: max concurrent bridged connections
+        let max_connections = config.server.max_connections.unwrap_or(200) as usize;
+        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
+        // Per-connection timeout (seconds)
+        let conn_timeout_secs = config.server.request_timeout_seconds.unwrap_or(300) as u64;
+        // Expected parent CID (only the parent EC2 instance should connect)
+        const EXPECTED_PARENT_CID: u32 = 3;
+
+        let bridge_handle = tokio::spawn(async move {
+            let mut consecutive_errors: u32 = 0;
             loop {
                 match vsock_listener.accept().await {
                     Ok((mut vsock_stream, peer)) => {
-                        info!("vsock connection from CID {}", peer.cid());
+                        consecutive_errors = 0;
+
+                        // CID validation: only accept from parent instance
+                        if peer.cid() != EXPECTED_PARENT_CID {
+                            warn!("Rejected vsock connection from unexpected CID {}", peer.cid());
+                            continue;
+                        }
+
+                        // Acquire connection permit (blocks if at limit)
+                        let permit = match connection_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!("Connection limit reached ({}), dropping vsock connection", max_connections);
+                                continue;
+                            }
+                        };
+
+                        let timeout_duration = std::time::Duration::from_secs(conn_timeout_secs);
                         tokio::spawn(async move {
-                            match tokio::net::TcpStream::connect("127.0.0.1:50051").await {
-                                Ok(mut tcp_stream) => {
-                                    if let Err(e) = tokio::io::copy_bidirectional(
-                                        &mut vsock_stream,
-                                        &mut tcp_stream,
-                                    )
-                                    .await
-                                    {
-                                        error!("vsock bridge error: {}", e);
+                            let _permit = permit; // held until task ends
+                            let result = tokio::time::timeout(timeout_duration, async {
+                                match tokio::net::TcpStream::connect("127.0.0.1:50051").await {
+                                    Ok(mut tcp_stream) => {
+                                        if let Err(e) = tokio::io::copy_bidirectional(
+                                            &mut vsock_stream,
+                                            &mut tcp_stream,
+                                        )
+                                        .await
+                                        {
+                                            if e.kind() != std::io::ErrorKind::ConnectionReset {
+                                                error!("vsock bridge error: {}", e);
+                                            }
+                                        }
                                     }
+                                    Err(e) => error!("TCP connect failed: {}", e),
                                 }
-                                Err(e) => error!("TCP connect failed: {}", e),
+                            })
+                            .await;
+
+                            if result.is_err() {
+                                warn!("vsock bridge connection timed out");
                             }
                         });
                     }
                     Err(e) => {
+                        consecutive_errors += 1;
                         error!("vsock accept error: {}", e);
+                        // Exponential backoff on consecutive errors
+                        let backoff_ms = std::cmp::min(10 * 2u64.pow(consecutive_errors), 1000);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
                 }
             }
@@ -214,6 +254,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error!("Server error: {}", e);
                     std::process::exit(1);
                 }
+            }
+            result = bridge_handle => {
+                // If bridge task exits/panics, the enclave is unreachable — fatal
+                error!("vsock bridge exited unexpectedly: {:?}", result);
+                std::process::exit(1);
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received shutdown signal, stopping server");
