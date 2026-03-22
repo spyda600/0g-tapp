@@ -42,6 +42,9 @@ pub fn validate_and_sanitize(compose_content: &str, limits: &ResourceLimits) -> 
             reason: format!("Failed to parse compose YAML: {}", e),
         })?;
 
+    // Check top-level forbidden keys (include, named volume host binds)
+    check_forbidden_top_level(&doc)?;
+
     let services = extract_services_mut(&mut doc)?;
 
     let service_names: Vec<String> = match services {
@@ -98,21 +101,57 @@ fn validate_service(service_name: &str, service: &Value) -> TappResult<()> {
 
 /// Reject dangerous compose keys that could enable container escape.
 fn check_forbidden_keys(name: &str, svc: &Value) -> TappResult<()> {
-    // devices: can map host devices (/dev/mem, /dev/sda) into container
-    if svc.get("devices").is_some() {
-        return rejection(name, "'devices' is not allowed — host device access is forbidden");
+    let forbidden = [
+        ("devices", "host device access is forbidden"),
+        ("sysctls", "kernel parameter modification is forbidden"),
+        ("userns_mode", "user namespace manipulation is forbidden"),
+        ("cgroup_parent", "cgroup escape is forbidden"),
+        ("build", "building images is forbidden — use pre-built images only"),
+        ("env_file", "reading host files via env_file is forbidden — use 'environment' instead"),
+        ("extends", "extending from external files is forbidden"),
+        ("runtime", "custom container runtimes are forbidden"),
+        ("extra_hosts", "host file injection is forbidden"),
+        ("dns", "custom DNS servers are forbidden"),
+        ("dns_search", "custom DNS search domains are forbidden"),
+        ("uts", "host UTS namespace sharing is forbidden"),
+    ];
+    for (key, reason) in &forbidden {
+        if svc.get(*key).is_some() {
+            return rejection(name, &format!("'{}' is not allowed — {}", key, reason));
+        }
     }
-    // sysctls: can modify host kernel parameters
-    if svc.get("sysctls").is_some() {
-        return rejection(name, "'sysctls' is not allowed — kernel parameter modification is forbidden");
+    Ok(())
+}
+
+/// Reject dangerous top-level compose keys (outside services).
+fn check_forbidden_top_level(root: &Value) -> TappResult<()> {
+    // include: pulls in unvalidated external compose files
+    if root.get("include").is_some() {
+        return Err(DockerError::InvalidComposeContent {
+            reason: "Top-level 'include' is not allowed — all services must be in the submitted compose file".to_string(),
+        }.into());
     }
-    // userns_mode: can disable user namespace isolation
-    if svc.get("userns_mode").is_some() {
-        return rejection(name, "'userns_mode' is not allowed");
-    }
-    // cgroup_parent: can escape cgroup isolation
-    if svc.get("cgroup_parent").is_some() {
-        return rejection(name, "'cgroup_parent' is not allowed");
+    // Check top-level volumes for driver_opts that bind to host paths
+    if let Some(volumes) = root.get("volumes") {
+        if let Some(volumes_map) = volumes.as_mapping() {
+            for (vol_name, vol_def) in volumes_map {
+                if let Some(driver_opts) = vol_def.get("driver_opts") {
+                    if let Some(device) = driver_opts.get("device") {
+                        if let Some(device_str) = device.as_str() {
+                            if device_str.starts_with('/') {
+                                let name_str = vol_name.as_str().unwrap_or("unknown");
+                                return Err(DockerError::InvalidComposeContent {
+                                    reason: format!(
+                                        "Named volume '{}' uses driver_opts.device='{}' which binds to a host path — this is forbidden",
+                                        name_str, device_str
+                                    ),
+                                }.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

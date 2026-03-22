@@ -197,7 +197,7 @@ impl DockerComposeManager {
         let (all_stdout, all_stderr) = {
             let mut child = Command::new("docker")
                 .current_dir(&base_path)
-                .args(["compose", "-f", "docker-compose.yml", "up", "-d"])
+                .args(["compose", "-f", "docker-compose.yml", "up", "-d", "--no-build"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
