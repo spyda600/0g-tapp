@@ -80,8 +80,9 @@ async fn send_request(request: &DockerProxyRequest) -> TappResult<DockerProxyRes
         "Connecting to parent Docker proxy via vsock"
     );
 
+    let addr = tokio_vsock::VsockAddr::new(PARENT_CID, DOCKER_PROXY_PORT);
     let mut stream =
-        VsockStream::connect(PARENT_CID, DOCKER_PROXY_PORT)
+        VsockStream::connect(addr)
             .await
             .map_err(|e| {
                 TappError::Docker(DockerError::ContainerOperationFailed {

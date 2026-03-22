@@ -59,9 +59,10 @@ impl LogsService {
         // Otherwise, return the specified file's content
         // Path traversal prevention: reject filenames with path separators or ..
         if request.file_name.contains("..") || request.file_name.contains('/') || request.file_name.contains('\\') {
-            return Err(crate::error::TappError::InvalidParameter(
-                "Invalid log file name".to_string(),
-            ));
+            return Err(crate::error::TappError::InvalidParameter {
+                field: "file_name".to_string(),
+                reason: "Path traversal characters (.., /, \\) are not allowed".to_string(),
+            });
         }
         let file_path = log_dir.join(&request.file_name);
 
