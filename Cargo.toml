@@ -94,11 +94,13 @@ hyper = "1.0"
 # Nitro Enclave support
 aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
 tokio-vsock = { version = "0.6", optional = true }
+# HTTP client for KMS API calls (used by key persistence in Nitro mode)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 
 [features]
 default = []
 tdx = ["dep:attestation-agent"]
-nitro = ["dep:aws-nitro-enclaves-nsm-api", "dep:tokio-vsock"]
+nitro = ["dep:aws-nitro-enclaves-nsm-api", "dep:tokio-vsock", "dep:reqwest"]
 simulation = []
 
 [build-dependencies]

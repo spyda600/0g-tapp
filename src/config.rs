@@ -37,6 +37,21 @@ pub struct LoggingConfig {
     pub file_path: Option<PathBuf>,
 }
 
+/// KMS key persistence configuration for Nitro Enclaves
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KmsConfig {
+    /// ARN of the KMS key used to encrypt/decrypt app keys
+    pub kms_key_id: String,
+
+    /// Path on the parent EC2 instance where encrypted key blobs are stored
+    #[serde(default = "default_kms_storage_path")]
+    pub storage_path: String,
+
+    /// AWS region for KMS API calls
+    #[serde(default = "default_kms_region")]
+    pub region: String,
+}
+
 /// Main configuration structure for TAPP service
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TappConfig {
@@ -48,6 +63,9 @@ pub struct TappConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub kbs: Option<KbsConfig>,
+    /// KMS-based key persistence for Nitro Enclaves.
+    #[serde(default)]
+    pub kms: Option<KmsConfig>,
 }
 
 impl TappConfig {
@@ -182,6 +200,14 @@ fn default_initial_delay() -> u64 {
 
 fn default_max_delay() -> u64 {
     30000
+}
+
+fn default_kms_storage_path() -> String {
+    "/opt/tapp/keys".to_string()
+}
+
+fn default_kms_region() -> String {
+    "us-east-1".to_string()
 }
 
 fn default_docker_socket() -> String {

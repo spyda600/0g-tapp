@@ -43,11 +43,12 @@ pub const NAME: &str = env!("CARGO_PKG_NAME");
 pub struct TappServiceImpl {
     pub config: TappConfig,
     pub boot_service: Arc<BootService>,
-    pub app_key_service: app_key::AppKeyService,
+    pub app_key_service: Arc<app_key::AppKeyService>,
     pub nonce_manager: Arc<nonce_manager::NonceManager>,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
     pub measurement_service: Arc<measurement_service::MeasurementService>,
+    pub update_safety: update_safety::UpdateSafetyChecker,
 }
 
 impl TappServiceImpl {
@@ -147,6 +148,12 @@ impl TappServiceImpl {
             app_key::AppKeyService::new(None, true, kms_config_ref).await?
         };
 
+        let app_key_service = Arc::new(app_key_service);
+
+        // Initialize UpdateSafetyChecker for pre-update verification
+        let update_safety =
+            update_safety::UpdateSafetyChecker::new(app_key_service.clone());
+
         // Initialize LogsService
         let logs_service =
             service_monitor::logs::LogsService::new(config.logging.file_path.clone());
@@ -160,6 +167,7 @@ impl TappServiceImpl {
             logs_service,
             permission_manager,
             measurement_service,
+            update_safety,
             config,
         })
     }
@@ -1389,6 +1397,166 @@ impl TappService for TappServiceImpl {
         );
 
         Ok(Response::new(response))
+    }
+
+    // -----------------------------------------------------------------------
+    // Safe update rollout RPCs
+    // -----------------------------------------------------------------------
+
+    async fn pre_update_check(
+        &self,
+        _request: Request<PreUpdateCheckRequest>,
+    ) -> Result<Response<PreUpdateCheckResponse>, Status> {
+        info!("Calling PreUpdateCheck");
+
+        let report = self.update_safety.pre_update_check().await.map_err(|e| {
+            error!(error = %e, "Pre-update check failed");
+            Status::internal(format!("Pre-update check failed: {}", e))
+        })?;
+
+        let key_statuses: Vec<proto::KeyBackupStatus> = report
+            .key_statuses
+            .into_iter()
+            .map(|ks| proto::KeyBackupStatus {
+                app_id: ks.app_id,
+                backed_up: ks.backed_up,
+                verified: ks.verified,
+                last_backup_timestamp: ks.last_backup_timestamp,
+                error: ks.error.unwrap_or_default(),
+                eth_address_hex: ks.eth_address_hex,
+            })
+            .collect();
+
+        Ok(Response::new(PreUpdateCheckResponse {
+            success: true,
+            message: if report.is_safe_to_update {
+                "All keys backed up and verified - safe to update".to_string()
+            } else {
+                "NOT safe to update - some keys are not backed up or verified".to_string()
+            },
+            is_safe_to_update: report.is_safe_to_update,
+            total_keys: report.total_keys as i32,
+            backed_up_count: report.backed_up_count as i32,
+            verified_count: report.verified_count as i32,
+            key_statuses,
+            timestamp: report.timestamp,
+        }))
+    }
+
+    async fn export_emergency_backup(
+        &self,
+        request: Request<ExportEmergencyBackupRequest>,
+    ) -> Result<Response<ExportEmergencyBackupResponse>, Status> {
+        info!("Calling ExportEmergencyBackup");
+
+        let req = request.into_inner();
+
+        if req.passphrase.is_empty() {
+            return Err(Status::invalid_argument(
+                "passphrase must not be empty for emergency backup encryption",
+            ));
+        }
+        if req.passphrase.len() < 12 {
+            return Err(Status::invalid_argument(
+                "passphrase must be at least 12 characters for adequate security",
+            ));
+        }
+
+        let output_path = if req.output_path.is_empty() {
+            None
+        } else {
+            Some(req.output_path.as_str())
+        };
+
+        let result = self
+            .update_safety
+            .export_emergency_backup(&req.passphrase, output_path)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Emergency backup export failed");
+                Status::internal(format!("Emergency backup failed: {}", e))
+            })?;
+
+        Ok(Response::new(ExportEmergencyBackupResponse {
+            success: true,
+            message: format!("Emergency backup exported: {} keys", result.keys_exported),
+            backup_path: result.backup_path,
+            keys_exported: result.keys_exported as i32,
+            backup_hash: result.backup_hash_hex,
+            timestamp: chrono::Utc::now().timestamp(),
+        }))
+    }
+
+    async fn verify_key_backup(
+        &self,
+        request: Request<VerifyKeyBackupRequest>,
+    ) -> Result<Response<VerifyKeyBackupResponse>, Status> {
+        info!("Calling VerifyKeyBackup");
+
+        let req = request.into_inner();
+        let app_id = req.app_id;
+
+        if app_id.is_empty() {
+            return Err(Status::invalid_argument("app_id must not be empty"));
+        }
+
+        // Check if the key exists in memory first
+        let (eth_address_hex, has_key) =
+            match self.app_key_service.get_public_key(&app_id).await {
+                Ok((eth_address, _, _)) => {
+                    (format!("0x{}", hex::encode(&eth_address)), true)
+                }
+                Err(_) => (String::new(), false),
+            };
+
+        if !has_key {
+            return Ok(Response::new(VerifyKeyBackupResponse {
+                success: false,
+                message: format!("No key found in memory for app {}", app_id),
+                backed_up: false,
+                verified: false,
+                last_backup_timestamp: 0,
+                eth_address_hex: String::new(),
+            }));
+        }
+
+        match self.app_key_service.verify_key_backup(&app_id).await {
+            Ok(verified) => {
+                info!(
+                    app_id = %app_id,
+                    verified = verified,
+                    "Key backup verification complete"
+                );
+                Ok(Response::new(VerifyKeyBackupResponse {
+                    success: true,
+                    message: if verified {
+                        "Backup verified - key can be recovered after restart".to_string()
+                    } else {
+                        "BACKUP MISMATCH - backup does not match in-memory key!".to_string()
+                    },
+                    backed_up: true,
+                    verified,
+                    last_backup_timestamp: chrono::Utc::now().timestamp(),
+                    eth_address_hex,
+                }))
+            }
+            Err(e) => {
+                let msg = format!("Backup verification failed: {}", e);
+                tracing::warn!(
+                    app_id = %app_id,
+                    error = %e,
+                    "Key backup verification failed"
+                );
+                Ok(Response::new(VerifyKeyBackupResponse {
+                    success: false,
+                    message: msg,
+                    backed_up: false,
+                    verified: false,
+                    last_backup_timestamp: 0,
+                    eth_address_hex,
+                }))
+            }
+        }
     }
 }
 

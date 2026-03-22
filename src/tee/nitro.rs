@@ -109,7 +109,7 @@ impl NitroProvider {
     /// `/dev/nsm` via ioctl. The returned COSE Sign1 document is signed by
     /// AWS Nitro Attestation PKI and contains PCRs, user_data, and nonce.
     #[cfg(feature = "nitro")]
-    fn nsm_get_attestation_doc(user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
+    pub(crate) fn nsm_get_attestation_doc(user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
         use aws_nitro_enclaves_nsm_api::api::{Request, Response};
         use aws_nitro_enclaves_nsm_api::driver;
 
@@ -161,7 +161,7 @@ impl NitroProvider {
     }
 
     #[cfg(not(feature = "nitro"))]
-    fn nsm_get_attestation_doc(_user_data: &[u8], _nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
+    pub(crate) fn nsm_get_attestation_doc(_user_data: &[u8], _nonce: &[u8]) -> Result<Vec<u8>, TeeError> {
         Err(TeeError::AttestationFailed(
             "NSM attestation requires the 'nitro' feature and a Nitro Enclave environment".to_string(),
         ))
