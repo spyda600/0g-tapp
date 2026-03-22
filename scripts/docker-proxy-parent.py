@@ -45,6 +45,23 @@ def validate_working_dir(working_dir: str) -> bool:
     return real.startswith(os.path.realpath(ALLOWED_BASE))
 
 
+def validate_name(name: str, field: str) -> str:
+    """Validate that a name (service, container, image) is safe for CLI use.
+    Prevents argument injection via Docker CLI flags."""
+    import re
+    if not name:
+        raise ValueError(f"{field} cannot be empty")
+    if len(name) > 256:
+        raise ValueError(f"{field} too long (max 256 chars)")
+    # Allow alphanumeric, hyphens, underscores, dots, colons, slashes (for image tags)
+    if not re.match(r'^[a-zA-Z0-9._:/@-]+$', name):
+        raise ValueError(f"{field} contains invalid characters: {name!r}")
+    # Must not start with a hyphen (prevents --flag injection)
+    if name.startswith('-'):
+        raise ValueError(f"{field} must not start with '-': {name!r}")
+    return name
+
+
 def recv_exact(conn: socket.socket, n: int) -> bytes:
     """Read exactly n bytes from a socket."""
     buf = b""
@@ -158,6 +175,7 @@ def handle_request(req: dict) -> dict:
             args.extend(["--tail", str(tail)])
         service_name = req.get("service_name")
         if service_name:
+            validate_name(service_name, "service_name")
             args.append(service_name)
         return run_command(args, cwd=working_dir)
 
@@ -197,7 +215,7 @@ def handle_request(req: dict) -> dict:
                 "exit_code": -1,
             }
         return run_command(
-            ["docker", "compose", "stop", service_name],
+            ["docker", "compose", "stop", "--", validate_name(service_name, "service_name")],
             cwd=working_dir,
         )
 
@@ -244,7 +262,7 @@ def handle_request(req: dict) -> dict:
                 "exit_code": -1,
             }
         return run_command(
-            ["docker", "inspect", "--format={{index .RepoDigests 0}}", image_id],
+            ["docker", "inspect", "--format={{index .RepoDigests 0}}", "--", validate_name(image_id, "image_id")],
         )
 
     elif command == "inspect_started_at":
@@ -257,7 +275,7 @@ def handle_request(req: dict) -> dict:
                 "exit_code": -1,
             }
         return run_command(
-            ["docker", "inspect", "--format={{.State.StartedAt}}", container_name],
+            ["docker", "inspect", "--format={{.State.StartedAt}}", "--", validate_name(container_name, "container_name")],
         )
 
     elif command == "system_prune":
