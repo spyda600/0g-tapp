@@ -5,9 +5,39 @@ use tapp_service::{
     permission::PermissionManager, tee::create_tee_provider, TappServiceImpl, TappServiceServer,
     VERSION,
 };
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tapp_service::config::ServerConfig;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
+
+/// Load TLS configuration from cert/key files if TLS is enabled.
+fn load_tls_config(
+    server_config: &ServerConfig,
+) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
+    if !server_config.tls_enabled {
+        return Ok(None);
+    }
+
+    let cert_path = server_config
+        .tls_cert_path
+        .as_ref()
+        .ok_or("TLS is enabled but tls_cert_path is not set in server config")?;
+
+    let key_path = server_config
+        .tls_key_path
+        .as_ref()
+        .ok_or("TLS is enabled but tls_key_path is not set in server config")?;
+
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| format!("Failed to read TLS certificate: {}", e))?;
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| format!("Failed to read TLS private key: {}", e))?;
+
+    let identity = Identity::from_pem(&cert_pem, &key_pem);
+    let tls_config = ServerTlsConfig::new().identity(identity);
+
+    Ok(Some(tls_config))
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "tapp-server")]
@@ -279,7 +309,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
 
-        let server = Server::builder()
+        let tls_config = load_tls_config(&config.server)?;
+
+        let mut builder = Server::builder();
+        if let Some(tls) = tls_config {
+            builder = builder
+                .tls_config(tls)
+                .map_err(|e| format!("TLS configuration error: {}", e))?;
+            info!("TLS enabled for gRPC server");
+        } else {
+            warn!("TLS is DISABLED — gRPC traffic is unencrypted. Enable TLS for production.");
+        }
+
+        let server = builder
             .layer(layer)
             .add_service(TappServiceServer::new(service))
             .serve(addr);
