@@ -6,6 +6,7 @@ pub mod config;
 #[cfg(feature = "nitro")]
 pub mod docker_proxy;
 pub mod error;
+pub mod tee;
 pub mod measurement_service;
 pub mod nonce_manager;
 pub mod permission;
