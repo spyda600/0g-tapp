@@ -92,6 +92,28 @@ fn validate_service(service_name: &str, service: &Value) -> TappResult<()> {
     check_cap_add(service_name, service)?;
     check_security_opt(service_name, service)?;
     check_volumes(service_name, service)?;
+    check_forbidden_keys(service_name, service)?;
+    Ok(())
+}
+
+/// Reject dangerous compose keys that could enable container escape.
+fn check_forbidden_keys(name: &str, svc: &Value) -> TappResult<()> {
+    // devices: can map host devices (/dev/mem, /dev/sda) into container
+    if svc.get("devices").is_some() {
+        return rejection(name, "'devices' is not allowed — host device access is forbidden");
+    }
+    // sysctls: can modify host kernel parameters
+    if svc.get("sysctls").is_some() {
+        return rejection(name, "'sysctls' is not allowed — kernel parameter modification is forbidden");
+    }
+    // userns_mode: can disable user namespace isolation
+    if svc.get("userns_mode").is_some() {
+        return rejection(name, "'userns_mode' is not allowed");
+    }
+    // cgroup_parent: can escape cgroup isolation
+    if svc.get("cgroup_parent").is_some() {
+        return rejection(name, "'cgroup_parent' is not allowed");
+    }
     Ok(())
 }
 
