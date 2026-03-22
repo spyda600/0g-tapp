@@ -8,14 +8,31 @@ use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Ethereum key pair
-#[derive(Clone)]
+///
+/// Private key material is wrapped in `Zeroizing` to ensure it is securely
+/// erased from memory when dropped. Clone is intentionally not derived to
+/// prevent uncontrolled duplication of private key material.
 pub struct EthKeyPair {
-    pub private_key: Vec<u8>, // 32-byte private key (can be used to reconstruct SigningKey)
-    pub public_key: Vec<u8>,  // 64-byte uncompressed public key (without 0x04 prefix)
-    pub eth_address: Vec<u8>, // 20-byte Ethereum address
+    pub private_key: Zeroizing<Vec<u8>>, // 32-byte private key (zeroized on drop)
+    pub public_key: Vec<u8>,              // 64-byte uncompressed public key (without 0x04 prefix)
+    pub eth_address: Vec<u8>,             // 20-byte Ethereum address
     pub x25519_public_key: Option<Vec<u8>>, // 32-byte X25519 public key
+}
+
+impl EthKeyPair {
+    /// Create a duplicate of this key pair with separately allocated (and zeroized) private key.
+    /// This is intentionally not `Clone` to make private key duplication explicit.
+    fn duplicate(&self) -> Self {
+        EthKeyPair {
+            private_key: Zeroizing::new(self.private_key.to_vec()),
+            public_key: self.public_key.clone(),
+            eth_address: self.eth_address.clone(),
+            x25519_public_key: self.x25519_public_key.clone(),
+        }
+    }
 }
 
 /// Application key service implementation
@@ -59,7 +76,7 @@ impl AppKeyService {
         use k256::elliptic_curve::rand_core::OsRng;
 
         let signing_key = SigningKey::random(&mut OsRng);
-        let private_key = signing_key.to_bytes().to_vec();
+        let private_key = Zeroizing::new(signing_key.to_bytes().to_vec());
         let verifying_key = signing_key.verifying_key();
 
         // Get uncompressed public key
@@ -82,6 +99,9 @@ impl AppKeyService {
 
             // Create x25519 secret from the same private key
             let x25519_secret = x25519_dalek::StaticSecret::from(x25519_private_bytes);
+
+            // Zeroize the stack copy of private key bytes
+            x25519_private_bytes.zeroize();
 
             // Derive x25519 public key
             let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
@@ -115,7 +135,7 @@ impl AppKeyService {
 
         if let Some(key_pair) = keys.get(app_id) {
             debug!(app_id = %app_id, "Using existing in-memory key");
-            return Ok(key_pair.clone());
+            return Ok(key_pair.duplicate());
         }
 
         // Generate new key
@@ -126,15 +146,17 @@ impl AppKeyService {
         );
         let key_pair = Self::generate_eth_keypair(x25519)?;
 
-        // Store it
-        keys.insert(app_id.to_string(), key_pair.clone());
+        // Return a duplicate; store the original in the map
+        let result = key_pair.duplicate();
+        keys.insert(app_id.to_string(), key_pair);
 
-        Ok(key_pair)
+        Ok(result)
     }
 
     /// Get private key for an app (internal use only)
-    /// WARNING: This returns sensitive private key material
-    pub async fn get_private_key(&self, app_id: &str) -> TappResult<Vec<u8>> {
+    /// WARNING: This returns sensitive private key material wrapped in Zeroizing
+    /// to ensure it is erased from memory when dropped.
+    pub async fn get_private_key(&self, app_id: &str) -> TappResult<Zeroizing<Vec<u8>>> {
         if !self.use_in_memory {
             return Err(DockerError::ContainerOperationFailed {
                 operation: "get_private_key".to_string(),
@@ -149,7 +171,7 @@ impl AppKeyService {
                 app_id = %app_id,
                 "Private key retrieved - ensure this is for local access only"
             );
-            Ok(key_pair.private_key.clone())
+            Ok(Zeroizing::new(key_pair.private_key.to_vec()))
         } else {
             Err(DockerError::ServiceNotFound {
                 service_name: format!("Key for app_id: {}", app_id),
@@ -236,7 +258,7 @@ impl AppKeyService {
             let resource_uri = format!("kbs:///default/key/{}", app_id);
             match kbs_client.get_resource(&resource_uri).await {
                 Ok(_key_data) => Ok(EthKeyPair {
-                    private_key: vec![],
+                    private_key: Zeroizing::new(vec![]),
                     public_key: _key_data,
                     eth_address: vec![],
                     x25519_public_key: None,

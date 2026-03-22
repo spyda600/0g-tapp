@@ -508,7 +508,7 @@ impl TappService for TappServiceImpl {
                 Ok(Response::new(GetAppSecretKeyResponse {
                     success: true,
                     message: format!("Private key for app {}", req.app_id),
-                    private_key: key_response.private_key,
+                    private_key: key_response.private_key.to_vec(),
                     public_key: key_response.public_key,
                     eth_address: key_response.eth_address,
                     x25519_public_key: key_response.x25519_public_key.unwrap_or_default(),
