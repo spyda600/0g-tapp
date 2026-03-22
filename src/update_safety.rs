@@ -17,12 +17,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-// Argon2 parameters — intentionally expensive to resist brute-force on the
-// emergency backup passphrase. These are the OWASP-recommended minimums.
-const ARGON2_MEMORY_KIB: u32 = 64 * 1024; // 64 MiB
-const ARGON2_ITERATIONS: u32 = 3;
-const ARGON2_PARALLELISM: u32 = 1;
-const ARGON2_SALT_LEN: usize = 32;
+// PBKDF2 parameters — 600k iterations of HMAC-SHA256 per OWASP 2023 recommendation.
+// Note: PBKDF2 is not memory-hard (unlike Argon2). Acceptable for emergency backup
+// since the passphrase minimum is 16 chars and backups are rare events.
+const PBKDF2_ITERATIONS: u32 = 600_000;
+const PBKDF2_SALT_LEN: usize = 32;
 const AES_GCM_NONCE_LEN: usize = 12;
 const AES_256_KEY_LEN: usize = 32;
 
@@ -263,11 +262,11 @@ impl UpdateSafetyChecker {
             created_at: chrono::Utc::now().to_rfc3339(),
             key_count: entries.len(),
             kdf_params: KdfParams {
-                algorithm: "argon2id".to_string(),
-                memory_kib: ARGON2_MEMORY_KIB,
-                iterations: ARGON2_ITERATIONS,
-                parallelism: ARGON2_PARALLELISM,
-                salt_len: ARGON2_SALT_LEN,
+                algorithm: "pbkdf2-hmac-sha256".to_string(),
+                memory_kib: 0, // not applicable for PBKDF2
+                iterations: PBKDF2_ITERATIONS,
+                parallelism: 1, // not applicable for PBKDF2
+                salt_len: PBKDF2_SALT_LEN,
             },
             keys: entries,
         };
@@ -331,12 +330,12 @@ impl UpdateSafetyChecker {
         eth_address_hex: &str,
     ) -> TappResult<EmergencyBackupEntry> {
         // Generate per-key random salt.
-        let mut salt = vec![0u8; ARGON2_SALT_LEN];
+        let mut salt = vec![0u8; PBKDF2_SALT_LEN];
         rng.fill(&mut salt)
             .map_err(|_| crate::error::TappError::Crypto("RNG failure generating salt".to_string()))?;
 
         // Derive AES-256 key from passphrase + salt via Argon2id.
-        let derived_key = Self::derive_key_argon2(passphrase, &salt)?;
+        let derived_key = Self::derive_key_pbkdf2(passphrase, &salt)?;
 
         // Generate per-key random nonce.
         let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
@@ -377,7 +376,7 @@ impl UpdateSafetyChecker {
     /// Current implementation: HKDF-SHA256 (passphrase || salt) with an
     /// extra PBKDF2-like strengthening pass. This is NOT memory-hard but
     /// provides a reasonable baseline when the `argon2` crate is unavailable.
-    fn derive_key_argon2(passphrase: &str, salt: &[u8]) -> TappResult<Vec<u8>> {
+    fn derive_key_pbkdf2(passphrase: &str, salt: &[u8]) -> TappResult<Vec<u8>> {
         // Use ring's PBKDF2 with HMAC-SHA256 as a solid KDF.
         // 600_000 iterations is the OWASP recommendation for PBKDF2-SHA256.
         let mut derived = vec![0u8; AES_256_KEY_LEN];
@@ -480,7 +479,7 @@ impl UpdateSafetyChecker {
             )));
         }
 
-        let derived_key = Self::derive_key_argon2(passphrase, &salt)?;
+        let derived_key = Self::derive_key_pbkdf2(passphrase, &salt)?;
 
         let unbound = UnboundKey::new(&AES_256_GCM, &derived_key)
             .map_err(|_| crate::error::TappError::Crypto("Failed to create AES-256-GCM key".to_string()))?;
