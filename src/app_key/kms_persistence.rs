@@ -249,19 +249,20 @@ impl KmsPersistence {
     }
 
     /// Check if an encrypted backup exists for the given app.
-    pub async fn has_backup(&self, app_id: &str) -> bool {
+    /// Returns Err on connectivity issues — caller must NOT treat errors as "no backup".
+    pub async fn has_backup(&self, app_id: &str) -> Result<bool, crate::error::TappError> {
         let blob_path = self.blob_path(app_id);
-        match self.file_exists_on_parent(&blob_path).await {
-            Ok(exists) => exists,
-            Err(e) => {
-                warn!(
-                    app_id = %app_id,
-                    error = %e,
-                    "Failed to check backup existence, assuming no backup"
-                );
-                false
-            }
-        }
+        self.file_exists_on_parent(&blob_path).await.map_err(|e| {
+            error!(
+                app_id = %app_id,
+                error = %e,
+                "Failed to check backup existence — connectivity issue, NOT treating as 'no backup'"
+            );
+            crate::error::TappError::Internal(format!(
+                "Cannot verify backup status for '{}': {}. Refusing to proceed.",
+                app_id, e
+            ))
+        })
     }
 
     /// Verify that the backup for an app matches the provided in-memory key.

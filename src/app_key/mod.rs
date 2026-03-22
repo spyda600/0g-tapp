@@ -189,7 +189,9 @@ impl AppKeyService {
 
         // Step 2: Attempt KMS recovery if persistence is configured
         if let Some(ref kms) = self.kms_persistence {
-            if kms.has_backup(app_id).await {
+            // has_backup returns Err on connectivity issues — propagate the error
+            // rather than assuming no backup (which would generate a new key).
+            if kms.has_backup(app_id).await? {
                 info!(app_id = %app_id, "Found KMS backup, attempting key recovery");
                 match kms.recover_key(app_id).await {
                     Ok(recovered_private_key) => {
@@ -244,15 +246,21 @@ impl AppKeyService {
                     info!(app_id = %app_id, "New key backed up to KMS successfully");
                 }
                 Err(e) => {
-                    // Backup failed. The key exists in memory but is NOT persisted.
-                    // This is dangerous -- log at maximum severity.
+                    // SAFETY: Backup failed. Do NOT serve an unbacked key.
+                    // If we returned it and the enclave crashes, the key and
+                    // any funds sent to its address would be permanently lost.
                     error!(
                         app_id = %app_id,
                         error = %e,
-                        "CRITICAL: Failed to backup new key to KMS! Key exists in memory only. \
-                         If the enclave restarts, this key and any associated funds WILL BE LOST. \
-                         Investigate KMS connectivity and retry."
+                        "CRITICAL: Failed to backup new key to KMS! Refusing to serve \
+                         an unbacked key to prevent potential fund loss. \
+                         Fix KMS connectivity and retry."
                     );
+                    return Err(crate::error::TappError::Internal(format!(
+                        "Key generated but KMS backup failed for app '{}'. \
+                         Refusing to serve unbacked key to prevent fund loss. Error: {}",
+                        app_id, e
+                    )));
                 }
             }
         }
