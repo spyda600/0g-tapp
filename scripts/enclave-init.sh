@@ -31,6 +31,6 @@ if id tapp >/dev/null 2>&1; then
     chown -R tapp /var/lib/tapp /var/log/tapp 2>/dev/null || true
     exec runuser -u tapp -- /usr/local/bin/tapp-server --config /etc/tapp/config.toml "$@"
 else
-    echo "WARNING: Running as root (no 'tapp' user found)"
-    exec /usr/local/bin/tapp-server --config /etc/tapp/config.toml "$@"
+    echo "FATAL: 'tapp' user not found — refusing to run as root. Image is broken."
+    exit 1
 fi
