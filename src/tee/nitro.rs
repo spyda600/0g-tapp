@@ -168,11 +168,9 @@ impl NitroProvider {
     }
 }
 
-impl Default for NitroProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// NOTE: No Default impl — NitroProvider::new() is pub(crate) to prevent
+// external code from constructing fresh instances (which would zero the
+// measurement accumulator). A Default impl would bypass this restriction.
 
 #[async_trait]
 impl TeeProvider for NitroProvider {
