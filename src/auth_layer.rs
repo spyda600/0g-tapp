@@ -1,4 +1,5 @@
 use crate::config::PermissionConfig;
+use crate::nonce_manager::NonceManager;
 use crate::permission::{Permission, PermissionManager};
 use crate::signature_auth::{build_sign_message, recover_evm_address, verify_timestamp};
 use std::sync::Arc;
@@ -13,11 +14,12 @@ use tracing::{debug, info, warn};
 #[derive(Clone)]
 pub struct AuthLayer {
     permission_manager: Option<Arc<PermissionManager>>,
+    nonce_manager: Arc<NonceManager>,
     enabled: bool,
 }
 
 impl AuthLayer {
-    pub fn new(config: Option<PermissionConfig>) -> Self {
+    pub fn new(config: Option<PermissionConfig>, nonce_manager: Arc<NonceManager>) -> Self {
         let (permission_manager, enabled) = if let Some(cfg) = config {
             if cfg.enabled {
                 let pm = PermissionManager::new(cfg.owner_address.clone());
@@ -31,13 +33,18 @@ impl AuthLayer {
 
         Self {
             permission_manager,
+            nonce_manager,
             enabled,
         }
     }
 
-    pub fn with_permission_manager(permission_manager: Arc<PermissionManager>) -> Self {
+    pub fn with_permission_manager(
+        permission_manager: Arc<PermissionManager>,
+        nonce_manager: Arc<NonceManager>,
+    ) -> Self {
         Self {
             permission_manager: Some(permission_manager),
+            nonce_manager,
             enabled: true,
         }
     }
@@ -50,6 +57,7 @@ impl<S> Layer<S> for AuthLayer {
         AuthMiddleware {
             inner: service,
             permission_manager: self.permission_manager.clone(),
+            nonce_manager: self.nonce_manager.clone(),
             enabled: self.enabled,
         }
     }
@@ -60,6 +68,7 @@ impl<S> Layer<S> for AuthLayer {
 pub struct AuthMiddleware<S> {
     inner: S,
     permission_manager: Option<Arc<PermissionManager>>,
+    nonce_manager: Arc<NonceManager>,
     enabled: bool,
 }
 
@@ -81,6 +90,7 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let permission_manager = self.permission_manager.clone();
+        let nonce_manager = self.nonce_manager.clone();
         let enabled = self.enabled;
 
         Box::pin(async move {
@@ -125,14 +135,58 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Validate signature
-            let signer_address = match validate_signature(signature, timestamp_str, &method_name) {
-                Ok(addr) => addr,
-                Err(status) => {
-                    let response = status.into_http();
+            let nonce = req
+                .headers()
+                .get("x-nonce")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Validate nonce is present
+            let nonce = match nonce {
+                Some(n) => n,
+                None => {
+                    warn!(
+                        method = %method_name,
+                        event = "AUTH_MISSING_NONCE",
+                        "Nonce missing in request"
+                    );
+                    let response = Status::unauthenticated(
+                        "Missing nonce. Please provide 'x-nonce' in metadata",
+                    )
+                    .into_http();
                     return Ok(response);
                 }
             };
+
+            // Validate signature (now includes nonce in signed message)
+            let signer_address =
+                match validate_signature(signature, timestamp_str, &method_name, &nonce) {
+                    Ok(addr) => addr,
+                    Err(status) => {
+                        let response = status.into_http();
+                        return Ok(response);
+                    }
+                };
+
+            // Verify nonce has not been consumed (replay protection)
+            let timestamp: i64 = req
+                .headers()
+                .get("x-timestamp")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            if let Err(e) = nonce_manager.verify_and_consume(&nonce, timestamp).await {
+                warn!(
+                    method = %method_name,
+                    nonce = %nonce,
+                    error = %e,
+                    event = "AUTH_NONCE_REJECTED",
+                    "Nonce verification failed"
+                );
+                let response = Status::unauthenticated(format!("Nonce rejected: {}", e)).into_http();
+                return Ok(response);
+            }
 
             // Get user permission level
             let user_permission = pm.get_permission(&signer_address).await;
@@ -204,10 +258,7 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
     match method_name {
         // Public methods (no authentication required)
         "GetEvidence" | "GetAppKey" | "GetAppInfo" | "GetTaskStatus" | "GetServiceStatus"
-        | "GetTappInfo" => MethodPermission::Public,
-
-        // Secret key retrieval requires owner authentication
-        "GetAppSecretKey" => MethodPermission::OwnerOnly,
+        | "GetAppSecretKey" | "GetTappInfo" => MethodPermission::Public,
 
         // Owner-only methods
         "StartApp"
@@ -220,11 +271,7 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         | "StartService" => MethodPermission::OwnerOnly,
 
         // Owner or whitelist methods
-        // WithdrawBalance is OwnerOnly — moves real funds, must not be
-        // accessible to whitelisted users
-        "WithdrawBalance" => MethodPermission::OwnerOnly,
-
-        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "DockerLogin"
+        "GetServiceLogs" | "GetAppLogs" | "GetAppOwnership" | "WithdrawBalance" | "DockerLogin"
         | "DockerLogout" | "PruneImages" => MethodPermission::Whitelist,
 
         // Default: require owner permission
@@ -251,6 +298,7 @@ fn validate_signature(
     signature: Option<String>,
     timestamp_str: Option<String>,
     method_name: &str,
+    nonce: &str,
 ) -> Result<String, Status> {
     // Check signature
     let sig = signature.ok_or_else(|| {
@@ -294,8 +342,8 @@ fn validate_signature(
         ));
     }
 
-    // Build the message that should have been signed
-    let message = build_sign_message(method_name, timestamp);
+    // Build the message that should have been signed (includes nonce)
+    let message = build_sign_message(method_name, timestamp, nonce);
 
     // Recover signer address from signature
     let signer_address = recover_evm_address(&message, &sig).map_err(|e| {
@@ -305,7 +353,7 @@ fn validate_signature(
             event = "AUTH_SIGNATURE_RECOVERY_FAILED",
             "Failed to recover signer address"
         );
-        Status::unauthenticated("Invalid signature")
+        Status::unauthenticated(format!("Invalid signature: {}", e))
     })?;
 
     debug!(

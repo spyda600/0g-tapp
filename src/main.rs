@@ -1,8 +1,9 @@
 use clap::Parser;
 use std::sync::Arc;
 use tapp_service::{
-    auth_layer::AuthLayer, config::TappConfig, init_tracing, permission::PermissionManager,
-    tee::create_tee_provider, TappServiceImpl, TappServiceServer, VERSION,
+    auth_layer::AuthLayer, config::TappConfig, init_tracing, nonce_manager::NonceManager,
+    permission::PermissionManager, tee::create_tee_provider, TappServiceImpl, TappServiceServer,
+    VERSION,
 };
 use tonic::transport::Server;
 use tower::ServiceBuilder;
@@ -127,11 +128,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         measurement_service.get_tee_type().await
     );
 
-    // Step 7: Initialize service with PermissionManager and MeasurementService
+    // Step 7: Initialize NonceManager for replay attack prevention
+    let nonce_manager = Arc::new(NonceManager::new());
+
+    // Step 8: Initialize service with PermissionManager, MeasurementService, and NonceManager
     let service = match TappServiceImpl::new(
         config.clone(),
         permission_manager.clone(),
         measurement_service,
+        nonce_manager.clone(),
     )
     .await
     {
@@ -145,11 +150,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Step 8: Create gRPC server with auth layer
+    // Step 9: Create gRPC server with auth layer (shares NonceManager for replay protection)
     let auth_layer = if let Some(pm) = permission_manager {
-        AuthLayer::with_permission_manager(pm)
+        AuthLayer::with_permission_manager(pm, nonce_manager)
     } else {
-        AuthLayer::new(config.server.permission.clone())
+        AuthLayer::new(config.server.permission.clone(), nonce_manager)
     };
 
     let layer = ServiceBuilder::new().layer(auth_layer).into_inner();

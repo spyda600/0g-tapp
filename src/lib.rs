@@ -1,5 +1,4 @@
 pub mod app_key;
-pub mod tee;
 pub mod auth_layer;
 pub mod balance_withdrawal;
 pub mod boot;
@@ -41,7 +40,7 @@ pub struct TappServiceImpl {
     pub config: TappConfig,
     pub boot_service: Arc<BootService>,
     pub app_key_service: app_key::AppKeyService,
-    pub nonce_manager: nonce_manager::NonceManager,
+    pub nonce_manager: Arc<nonce_manager::NonceManager>,
     pub logs_service: service_monitor::logs::LogsService,
     pub permission_manager: Option<Arc<permission::PermissionManager>>,
     pub measurement_service: Arc<measurement_service::MeasurementService>,
@@ -123,6 +122,7 @@ impl TappServiceImpl {
         config: TappConfig,
         permission_manager: Option<Arc<permission::PermissionManager>>,
         measurement_service: Arc<measurement_service::MeasurementService>,
+        nonce_manager: Arc<nonce_manager::NonceManager>,
     ) -> TappResult<Self> {
         info!("Initializing TAPP service components");
 
@@ -141,9 +141,6 @@ impl TappServiceImpl {
             info!("KBS config not provided, using in-memory key generation");
             app_key::AppKeyService::new(None, true).await?
         };
-
-        // Initialize NonceManager for replay attack prevention
-        let nonce_manager = nonce_manager::NonceManager::new();
 
         // Initialize LogsService
         let logs_service =

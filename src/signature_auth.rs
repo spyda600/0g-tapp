@@ -85,9 +85,9 @@ pub fn verify_timestamp(timestamp: i64) -> Result<bool> {
     Ok(true)
 }
 
-/// Build the message format for signing: "method_name:timestamp"
-pub fn build_sign_message(method_name: &str, timestamp: i64) -> String {
-    format!("{}:{}", method_name, timestamp)
+/// Build the message format for signing: "method_name:timestamp:nonce"
+pub fn build_sign_message(method_name: &str, timestamp: i64, nonce: &str) -> String {
+    format!("{}:{}:{}", method_name, timestamp, nonce)
 }
 
 // ============================================================================
@@ -225,8 +225,8 @@ mod tests {
 
     #[test]
     fn test_build_sign_message() {
-        let message = build_sign_message("StartApp", 1234567890);
-        assert_eq!(message, "StartApp:1234567890");
+        let message = build_sign_message("StartApp", 1234567890, "abc12345");
+        assert_eq!(message, "StartApp:1234567890:abc12345");
     }
 
     // Integration test with real signature
@@ -236,11 +236,11 @@ mod tests {
     #[ignore] // Run with: cargo test -- --ignored
     fn test_recover_address_integration() {
         // Example test vector (you need to generate this with a real wallet)
-        // Message: "StartApp:1234567890"
+        // Message: "StartApp:1234567890:test-nonce-abc123"
         // Private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
         // Expected address: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
 
-        let message = "StartApp:1234567890";
+        let message = "StartApp:1234567890:test-nonce-abc123";
         let signature = "0x..."; // Replace with actual signature
         let expected_address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 

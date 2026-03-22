@@ -2,6 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Minimum nonce length in characters
+const NONCE_MIN_LENGTH: usize = 8;
+/// Maximum nonce length in characters
+const NONCE_MAX_LENGTH: usize = 64;
+
 /// Nonce manager to prevent replay attacks
 /// Tracks used nonces with expiration
 pub struct NonceManager {
@@ -36,6 +41,34 @@ impl NonceManager {
         manager
     }
 
+    /// Validate nonce format: must be 8-64 characters, alphanumeric (plus hyphens and underscores)
+    pub fn validate_nonce_format(nonce: &str) -> Result<(), String> {
+        if nonce.len() < NONCE_MIN_LENGTH {
+            return Err(format!(
+                "Nonce too short: {} chars, minimum is {}",
+                nonce.len(),
+                NONCE_MIN_LENGTH
+            ));
+        }
+        if nonce.len() > NONCE_MAX_LENGTH {
+            return Err(format!(
+                "Nonce too long: {} chars, maximum is {}",
+                nonce.len(),
+                NONCE_MAX_LENGTH
+            ));
+        }
+        if !nonce
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(
+                "Nonce contains invalid characters: only alphanumeric, hyphens, and underscores are allowed"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Verify and consume a nonce
     /// Returns Ok(()) if nonce is valid and not used
     /// Returns Err if nonce is invalid, expired, or already used
@@ -44,6 +77,9 @@ impl NonceManager {
         nonce: &str,
         timestamp: i64,
     ) -> Result<(), String> {
+        // 0. Validate nonce format
+        Self::validate_nonce_format(nonce)?;
+
         let current_time = chrono::Utc::now().timestamp();
 
         // 1. Check timestamp validity
@@ -109,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonce_verify_and_consume() {
         let manager = NonceManager::with_validity_window(60);
-        let nonce = "test-nonce-123";
+        let nonce = "test-nonce-1234"; // min 8 chars
         let timestamp = chrono::Utc::now().timestamp();
 
         // First use should succeed
@@ -122,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonce_expired_timestamp() {
         let manager = NonceManager::with_validity_window(60);
-        let nonce = "test-nonce-456";
+        let nonce = "test-nonce-456abc";
         let old_timestamp = chrono::Utc::now().timestamp() - 120; // 2 minutes ago
 
         // Should fail due to expired timestamp
@@ -132,10 +168,35 @@ mod tests {
     #[tokio::test]
     async fn test_nonce_future_timestamp() {
         let manager = NonceManager::with_validity_window(60);
-        let nonce = "test-nonce-789";
+        let nonce = "test-nonce-789abc";
         let future_timestamp = chrono::Utc::now().timestamp() + 120; // 2 minutes in future
 
         // Should fail due to future timestamp
         assert!(manager.verify_and_consume(nonce, future_timestamp).await.is_err());
+    }
+
+    #[test]
+    fn test_nonce_format_validation() {
+        // Too short
+        assert!(NonceManager::validate_nonce_format("abc").is_err());
+
+        // Exactly minimum length (8)
+        assert!(NonceManager::validate_nonce_format("abcd1234").is_ok());
+
+        // Valid with hyphens and underscores
+        assert!(NonceManager::validate_nonce_format("abc-def_12345678").is_ok());
+
+        // Too long (65 chars)
+        let long_nonce = "a".repeat(65);
+        assert!(NonceManager::validate_nonce_format(&long_nonce).is_err());
+
+        // Exactly maximum length (64)
+        let max_nonce = "a".repeat(64);
+        assert!(NonceManager::validate_nonce_format(&max_nonce).is_ok());
+
+        // Invalid characters
+        assert!(NonceManager::validate_nonce_format("abcd1234!@#$").is_err());
+        assert!(NonceManager::validate_nonce_format("abcd 1234").is_err());
+        assert!(NonceManager::validate_nonce_format("abcd.1234").is_err());
     }
 }
