@@ -85,6 +85,17 @@ service TappService {
   // Get application container status
   rpc GetAppContainerStatus(GetAppContainerStatusRequest)
       returns (GetAppContainerStatusResponse);
+
+  // Update Safety Operations (Owner only)
+  // Pre-update check: verify all keys are backed up before enclave update
+  rpc PreUpdateCheck(PreUpdateCheckRequest) returns (PreUpdateCheckResponse);
+
+  // Export emergency backup of all keys with passphrase encryption
+  rpc ExportEmergencyBackup(ExportEmergencyBackupRequest)
+      returns (ExportEmergencyBackupResponse);
+
+  // Verify a specific app key's backup status
+  rpc VerifyKeyBackup(VerifyKeyBackupRequest) returns (VerifyKeyBackupResponse);
 }
 
 enum LogLevel {
@@ -571,4 +582,63 @@ message ContainerStatus {
   string state = 2;           // Container state (running, stopped, etc.)
   string health = 3;          // Health status (if available)
   repeated string ports = 4;  // Port mappings (e.g., "0.0.0.0:8080->80/tcp")
+}
+
+// ============================================================================
+// Update Safety Messages
+// ============================================================================
+
+// Pre-update check: verify all keys are safely backed up
+message PreUpdateCheckRequest {
+  // No parameters needed — checks all keys in memory
+}
+
+message KeyBackupStatus {
+  string app_id = 1;              // Application identifier
+  bool backed_up = 2;             // Whether a KMS backup blob exists
+  bool verified = 3;              // Whether the backup was verified decryptable
+  int64 last_backup_timestamp = 4; // Unix timestamp of last backup (0 if never)
+  string error = 5;               // Error details if verification failed
+  string eth_address_hex = 6;     // Ethereum address (for identification, not the key)
+}
+
+message PreUpdateCheckResponse {
+  bool success = 1;
+  string message = 2;
+  bool is_safe_to_update = 3;     // True only if ALL keys are backed up and verified
+  int32 total_keys = 4;           // Total number of keys in memory
+  int32 backed_up_count = 5;      // Keys with existing backup blobs
+  int32 verified_count = 6;       // Keys whose backups were verified decryptable
+  repeated KeyBackupStatus key_statuses = 7;  // Per-key details
+  int64 timestamp = 8;
+}
+
+// Export emergency backup with passphrase-based encryption
+message ExportEmergencyBackupRequest {
+  string passphrase = 1;          // Passphrase for AES-256-GCM encryption (Argon2 KDF)
+  string output_path = 2;         // Path on parent instance to write backup file
+                                  // Defaults to /opt/tapp/emergency-backup-<timestamp>.json
+}
+
+message ExportEmergencyBackupResponse {
+  bool success = 1;
+  string message = 2;
+  string backup_path = 3;         // Actual path where backup was written
+  int32 keys_exported = 4;        // Number of keys in the backup
+  string backup_hash = 5;         // SHA-256 hash of the backup file for integrity
+  int64 timestamp = 6;
+}
+
+// Verify a specific key's backup
+message VerifyKeyBackupRequest {
+  string app_id = 1;              // Application identifier to verify
+}
+
+message VerifyKeyBackupResponse {
+  bool success = 1;
+  string message = 2;
+  bool backed_up = 3;             // Whether backup blob exists
+  bool verified = 4;              // Whether backup is verified decryptable
+  int64 last_backup_timestamp = 5; // Unix timestamp of last backup
+  string eth_address_hex = 6;     // Ethereum address for confirmation
 }

@@ -7,6 +7,7 @@ pub mod config;
 pub mod docker_proxy;
 pub mod error;
 pub mod tee;
+pub mod update_safety;
 pub mod measurement_service;
 pub mod nonce_manager;
 pub mod permission;
@@ -136,13 +137,14 @@ impl TappServiceImpl {
         let boot_service =
             Arc::new(BootService::new(measurement_service.clone(), task_manager).await?);
 
-        // Initialize AppKeyService
+        // Initialize AppKeyService (with optional KMS persistence for Nitro)
+        let kms_config_ref = config.kms.as_ref();
         let app_key_service = if let Some(ref kbs) = config.kbs {
             info!("Using KBS for app key management");
-            app_key::AppKeyService::new(Some(kbs), false).await?
+            app_key::AppKeyService::new(Some(kbs), false, kms_config_ref).await?
         } else {
             info!("KBS config not provided, using in-memory key generation");
-            app_key::AppKeyService::new(None, true).await?
+            app_key::AppKeyService::new(None, true, kms_config_ref).await?
         };
 
         // Initialize LogsService

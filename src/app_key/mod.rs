@@ -1,13 +1,15 @@
 pub mod kbs_client;
+pub mod kms_persistence;
 pub use kbs_client::KbsClient;
+pub use kms_persistence::KmsPersistence;
 
-use crate::config::KbsConfig;
-use crate::error::{DockerError, TappResult};
+use crate::config::{KbsConfig, KmsConfig};
+use crate::error::{DockerError, TappError, TappResult};
 use k256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Ethereum key pair
@@ -42,13 +44,18 @@ pub struct AppKeyService {
     app_keys: Mutex<HashMap<String, EthKeyPair>>,
     /// Whether to use in-memory keys (if false, use KBS)
     use_in_memory: bool,
+    /// Optional KMS-based key persistence for Nitro Enclaves.
+    /// When present, keys are encrypted and backed up to the parent EC2
+    /// instance so they survive enclave restarts.
+    kms_persistence: Option<KmsPersistence>,
 }
 
 impl AppKeyService {
     /// Create new app key service
     pub async fn new(
-        kbs_config: Option<&KbsConfig>, // ← 改为 Option
+        kbs_config: Option<&KbsConfig>,
         use_in_memory: bool,
+        kms_config: Option<&KmsConfig>,
     ) -> TappResult<Self> {
         let kbs_client = if let Some(config) = kbs_config {
             info!(endpoint = %config.endpoint, "Initializing KBS client");
@@ -58,9 +65,43 @@ impl AppKeyService {
             None
         };
 
+        let kms_persistence = match kms_config {
+            Some(config) => match KmsPersistence::new(config) {
+                Ok(kms) => {
+                    info!(
+                        kms_key_id = %config.kms_key_id,
+                        "KMS key persistence enabled - keys will survive enclave restarts"
+                    );
+                    Some(kms)
+                }
+                Err(e) => {
+                    // LOUD warning: key persistence is configured but failed to initialize.
+                    // Fall back to in-memory only. This means keys WILL be lost on restart.
+                    error!(
+                        error = %e,
+                        "CRITICAL: KMS persistence configured but failed to initialize! \
+                         Keys will NOT be persisted across restarts. \
+                         Funds may be at risk if the enclave restarts."
+                    );
+                    warn!("Falling back to in-memory-only key storage (NO PERSISTENCE)");
+                    None
+                }
+            },
+            None => {
+                if use_in_memory {
+                    warn!(
+                        "No KMS persistence configured. In-memory keys will be lost on restart. \
+                         Configure [kms] in config.toml for production deployments."
+                    );
+                }
+                None
+            }
+        };
+
         info!(
             use_in_memory = use_in_memory,
             has_kbs_client = kbs_client.is_some(),
+            has_kms_persistence = kms_persistence.is_some(),
             "Initialized app key service"
         );
 
@@ -68,6 +109,7 @@ impl AppKeyService {
             kbs_client,
             app_keys: Mutex::new(HashMap::new()),
             use_in_memory,
+            kms_persistence,
         })
     }
 
@@ -125,7 +167,13 @@ impl AppKeyService {
         })
     }
 
-    /// Get or create key for an app (in-memory mode)
+    /// Get or create key for an app (in-memory mode with optional KMS persistence).
+    ///
+    /// Flow:
+    /// 1. If key exists in memory, return it.
+    /// 2. If KMS persistence is configured, attempt to recover from backup.
+    /// 3. If no backup exists (or KMS is unavailable), generate a new key.
+    /// 4. If a new key was generated and KMS is configured, back it up.
     async fn get_or_create_in_memory_key(
         &self,
         app_id: &str,
@@ -133,12 +181,44 @@ impl AppKeyService {
     ) -> TappResult<EthKeyPair> {
         let mut keys = self.app_keys.lock().await;
 
+        // Step 1: Check in-memory cache
         if let Some(key_pair) = keys.get(app_id) {
             debug!(app_id = %app_id, "Using existing in-memory key");
             return Ok(key_pair.duplicate());
         }
 
-        // Generate new key
+        // Step 2: Attempt KMS recovery if persistence is configured
+        if let Some(ref kms) = self.kms_persistence {
+            if kms.has_backup(app_id).await {
+                info!(app_id = %app_id, "Found KMS backup, attempting key recovery");
+                match kms.recover_key(app_id).await {
+                    Ok(recovered_private_key) => {
+                        info!(app_id = %app_id, "Successfully recovered key from KMS backup");
+                        let key_pair =
+                            Self::reconstruct_keypair_from_private_key(&recovered_private_key, x25519)?;
+                        let result = key_pair.duplicate();
+                        keys.insert(app_id.to_string(), key_pair);
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        // Recovery failed. This could be a PCR mismatch (enclave image changed)
+                        // or a transient KMS error. Log loudly but continue to generate new key.
+                        error!(
+                            app_id = %app_id,
+                            error = %e,
+                            "CRITICAL: KMS key recovery failed! A backup exists but could not be \
+                             decrypted. This may indicate an enclave image change (PCR mismatch) \
+                             or KMS connectivity issue. Generating a NEW key - the old key's \
+                             funds may be inaccessible."
+                        );
+                    }
+                }
+            } else {
+                debug!(app_id = %app_id, "No KMS backup found, will generate new key");
+            }
+        }
+
+        // Step 3: Generate new key
         info!(
             app_id = %app_id,
             x25519_enabled = x25519,
@@ -146,11 +226,112 @@ impl AppKeyService {
         );
         let key_pair = Self::generate_eth_keypair(x25519)?;
 
+        // Step 4: Back up to KMS if persistence is configured
+        if let Some(ref kms) = self.kms_persistence {
+            match kms.encrypt_and_backup(app_id, &key_pair.private_key).await {
+                Ok(()) => {
+                    info!(app_id = %app_id, "New key backed up to KMS successfully");
+                }
+                Err(e) => {
+                    // Backup failed. The key exists in memory but is NOT persisted.
+                    // This is dangerous -- log at maximum severity.
+                    error!(
+                        app_id = %app_id,
+                        error = %e,
+                        "CRITICAL: Failed to backup new key to KMS! Key exists in memory only. \
+                         If the enclave restarts, this key and any associated funds WILL BE LOST. \
+                         Investigate KMS connectivity and retry."
+                    );
+                }
+            }
+        }
+
         // Return a duplicate; store the original in the map
         let result = key_pair.duplicate();
         keys.insert(app_id.to_string(), key_pair);
 
         Ok(result)
+    }
+
+    /// Reconstruct a full EthKeyPair from a recovered private key.
+    fn reconstruct_keypair_from_private_key(
+        private_key_bytes: &[u8],
+        x25519: bool,
+    ) -> TappResult<EthKeyPair> {
+        if private_key_bytes.len() != 32 {
+            return Err(DockerError::ContainerOperationFailed {
+                operation: "reconstruct_keypair".to_string(),
+                reason: format!(
+                    "Recovered private key must be 32 bytes, got {}",
+                    private_key_bytes.len()
+                ),
+            }
+            .into());
+        }
+
+        let signing_key = SigningKey::from_slice(private_key_bytes).map_err(|e| {
+            DockerError::ContainerOperationFailed {
+                operation: "reconstruct_keypair".to_string(),
+                reason: format!("Invalid recovered private key: {}", e),
+            }
+        })?;
+
+        let private_key = Zeroizing::new(private_key_bytes.to_vec());
+        let verifying_key = signing_key.verifying_key();
+
+        let public_key_point = verifying_key.to_encoded_point(false);
+        let public_key_bytes = public_key_point.as_bytes();
+        let public_key_without_prefix = &public_key_bytes[1..];
+        let public_key = public_key_bytes.to_vec();
+
+        let x25519_public_key = if x25519 {
+            let mut x25519_private_bytes = [0u8; 32];
+            x25519_private_bytes.copy_from_slice(&private_key[..32]);
+            let x25519_secret = x25519_dalek::StaticSecret::from(x25519_private_bytes);
+            x25519_private_bytes.zeroize();
+            let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
+            Some(x25519_public.as_bytes().to_vec())
+        } else {
+            None
+        };
+
+        let mut hasher = Keccak256::new();
+        hasher.update(public_key_without_prefix);
+        let hash = hasher.finalize();
+        let eth_address = hash[12..].to_vec();
+
+        Ok(EthKeyPair {
+            private_key,
+            public_key,
+            eth_address,
+            x25519_public_key,
+        })
+    }
+
+    /// Verify that the KMS backup for an app matches the current in-memory key.
+    ///
+    /// Call this before planned restarts or enclave updates to ensure keys
+    /// can be recovered. Returns `Ok(true)` if backup matches, `Ok(false)` if
+    /// mismatch, or an error if verification cannot be performed.
+    pub async fn verify_key_backup(&self, app_id: &str) -> TappResult<bool> {
+        let kms = self.kms_persistence.as_ref().ok_or_else(|| {
+            TappError::Internal(
+                "KMS persistence not configured - cannot verify backup".to_string(),
+            )
+        })?;
+
+        let keys = self.app_keys.lock().await;
+        let key_pair = keys.get(app_id).ok_or_else(|| {
+            DockerError::ServiceNotFound {
+                service_name: format!("Key for app_id: {}", app_id),
+            }
+        })?;
+
+        // Drop the lock before the async KMS call
+        let private_key_copy = Zeroizing::new(key_pair.private_key.to_vec());
+        drop(keys);
+
+        kms.verify_backup(app_id, &private_key_copy).await
     }
 
     /// Get private key for an app (internal use only)
@@ -206,6 +387,29 @@ impl AppKeyService {
             }
             .into())
         }
+    }
+
+    /// List all app IDs that currently have keys in memory.
+    /// Used by update safety checks to enumerate keys that need backup verification.
+    pub async fn list_app_ids(&self) -> Vec<String> {
+        let keys = self.app_keys.lock().await;
+        keys.keys().cloned().collect()
+    }
+
+    /// Get a snapshot of all keys for backup purposes.
+    /// Returns (app_id, private_key_bytes, eth_address_hex) for each key.
+    ///
+    /// SECURITY: This method exists solely for emergency backup. The caller is
+    /// responsible for encrypting the returned key material immediately and
+    /// zeroizing any intermediate buffers.
+    pub async fn snapshot_all_keys(&self) -> TappResult<Vec<(String, Vec<u8>, String)>> {
+        let keys = self.app_keys.lock().await;
+        let mut result = Vec::with_capacity(keys.len());
+        for (app_id, key_pair) in keys.iter() {
+            let eth_addr_hex = format!("0x{}", hex::encode(&key_pair.eth_address));
+            result.push((app_id.clone(), key_pair.private_key.to_vec(), eth_addr_hex));
+        }
+        Ok(result)
     }
 
     /// Handle get app key request (public key only - for gRPC)
