@@ -201,16 +201,27 @@ impl AppKeyService {
                         return Ok(result);
                     }
                     Err(e) => {
-                        // Recovery failed. This could be a PCR mismatch (enclave image changed)
-                        // or a transient KMS error. Log loudly but continue to generate new key.
+                        // SAFETY: A backup EXISTS but decryption FAILED.
+                        // DO NOT generate a new key — that would make the old key's
+                        // funds permanently inaccessible.
+                        // This could be: PCR mismatch (update without policy change),
+                        // transient KMS error, or network issue.
+                        // The operator must fix the issue and retry.
                         error!(
                             app_id = %app_id,
                             error = %e,
                             "CRITICAL: KMS key recovery failed! A backup exists but could not be \
-                             decrypted. This may indicate an enclave image change (PCR mismatch) \
-                             or KMS connectivity issue. Generating a NEW key - the old key's \
-                             funds may be inaccessible."
+                             decrypted. REFUSING to generate a new key to prevent fund loss. \
+                             Check: 1) KMS key policy includes current PCR0, \
+                             2) IAM instance profile is attached, \
+                             3) Network connectivity to KMS. \
+                             Use the emergency backup if KMS cannot be restored."
                         );
+                        return Err(crate::error::TappError::Internal(format!(
+                            "Key recovery failed for app '{}': backup exists but cannot be decrypted. \
+                             Refusing to generate new key to prevent fund loss. Error: {}",
+                            app_id, e
+                        )));
                     }
                 }
             } else {
