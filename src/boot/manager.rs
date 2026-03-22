@@ -2,9 +2,11 @@ use crate::error::{DockerError, TappError, TappResult};
 use chrono;
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(not(feature = "nitro"))]
 use std::process::Stdio;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+#[cfg(not(feature = "nitro"))]
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
@@ -51,7 +53,6 @@ impl DockerComposeManager {
     /// Get the directory path for an app.
     /// Validates app_id to prevent path traversal attacks.
     pub fn get_app_dir(app_id: &str) -> PathBuf {
-        // Reject path traversal attempts
         assert!(
             !app_id.contains("..") && !app_id.contains('/') && !app_id.contains('\\') && !app_id.is_empty(),
             "Invalid app_id: must not contain path separators or be empty"
@@ -147,6 +148,7 @@ impl DockerComposeManager {
         let limits = super::compose_validator::ResourceLimits::default();
         let sanitized_content =
             super::compose_validator::validate_and_sanitize(compose_content, &limits)?;
+        let compose_content = &sanitized_content;
         info!(app_id = %app_id, "Compose content validated and sanitized");
 
         // 1. store compose file
@@ -159,7 +161,7 @@ impl DockerComposeManager {
             })?;
         }
         let compose_path = base_path.join("docker-compose.yml");
-        fs::write(&compose_path, &sanitized_content).await?;
+        fs::write(&compose_path, compose_content).await?;
 
         // 2. store mount files to corresponding location
         Self::store_mount_files(&base_path, mount_files).await?;
@@ -167,86 +169,115 @@ impl DockerComposeManager {
         // 3. start compose with real-time output
         info!(app_id = %app_id, "🚀 Starting docker compose up");
 
-        let mut child = Command::new("docker")
-            .current_dir(&base_path)
-            .args(["compose", "-f", "docker-compose.yml", "up", "-d"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_compose_up".to_string(),
-                reason: format!("Failed to execute docker compose command: {}", e),
-            })?;
-
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        // Collect output
-        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
-        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-
-        let app_id_clone = app_id.to_string();
-        let stdout_lines_clone = stdout_lines.clone();
-        let stdout_task = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                info!(
-                    app_id = %app_id_clone,
-                    output_type = "stdout",
-                    "🐳 {}", line
+        #[cfg(feature = "nitro")]
+        let (all_stdout, all_stderr) = {
+            let working_dir = base_path.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_up(app_id, compose_content, &working_dir).await?;
+            if !resp.success {
+                error!(
+                    app_id = %app_id,
+                    exit_code = resp.exit_code,
+                    stderr = %resp.stderr,
+                    stdout = %resp.stdout,
+                    "❌ Docker compose command failed (via proxy)"
                 );
-                stdout_lines_clone.lock().await.push(line);
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_up".to_string(),
+                    reason: format!(
+                        "Docker compose failed with exit code {}\nStderr: {}\nStdout: {}",
+                        resp.exit_code, resp.stderr, resp.stdout
+                    ),
+                }
+                .into());
             }
-        });
+            (resp.stdout, resp.stderr)
+        };
 
-        let app_id_clone = app_id.to_string();
-        let stderr_lines_clone = stderr_lines.clone();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                info!(
-                    app_id = %app_id_clone,
-                    "🐳 {}", line
+        #[cfg(not(feature = "nitro"))]
+        let (all_stdout, all_stderr) = {
+            let mut child = Command::new("docker")
+                .current_dir(&base_path)
+                .args(["compose", "-f", "docker-compose.yml", "up", "-d"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_up".to_string(),
+                    reason: format!("Failed to execute docker compose command: {}", e),
+                })?;
+
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+
+            // Collect output
+            let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+            let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+
+            let app_id_clone = app_id.to_string();
+            let stdout_lines_clone = stdout_lines.clone();
+            let stdout_task = tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    info!(
+                        app_id = %app_id_clone,
+                        output_type = "stdout",
+                        "🐳 {}", line
+                    );
+                    stdout_lines_clone.lock().await.push(line);
+                }
+            });
+
+            let app_id_clone = app_id.to_string();
+            let stderr_lines_clone = stderr_lines.clone();
+            let stderr_task = tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    info!(
+                        app_id = %app_id_clone,
+                        "🐳 {}", line
+                    );
+                    stderr_lines_clone.lock().await.push(line);
+                }
+            });
+
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_up".to_string(),
+                    reason: format!("Failed to wait for docker compose: {}", e),
+                })?;
+
+            let _ = tokio::join!(stdout_task, stderr_task);
+
+            let all_stdout = stdout_lines.lock().await.join("\n");
+            let all_stderr = stderr_lines.lock().await.join("\n");
+
+            if !status.success() {
+                error!(
+                    app_id = %app_id,
+                    exit_code = ?status.code(),
+                    stderr = %all_stderr,
+                    stdout = %all_stdout,
+                    "❌ Docker compose command failed"
                 );
-                stderr_lines_clone.lock().await.push(line);
+
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_up".to_string(),
+                    reason: format!(
+                        "Docker compose failed with exit code {:?}\nStderr: {}\nStdout: {}",
+                        status.code(),
+                        all_stderr,
+                        all_stdout
+                    ),
+                }
+                .into());
             }
-        });
 
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_compose_up".to_string(),
-                reason: format!("Failed to wait for docker compose: {}", e),
-            })?;
-
-        let _ = tokio::join!(stdout_task, stderr_task);
-
-        let all_stdout = stdout_lines.lock().await.join("\n");
-        let all_stderr = stderr_lines.lock().await.join("\n");
-
-        if !status.success() {
-            error!(
-                app_id = %app_id,
-                exit_code = ?status.code(),
-                stderr = %all_stderr,
-                stdout = %all_stdout,
-                "❌ Docker compose command failed"
-            );
-
-            return Err(DockerError::ContainerOperationFailed {
-                operation: "docker_compose_up".to_string(),
-                reason: format!(
-                    "Docker compose failed with exit code {:?}\nStderr: {}\nStdout: {}",
-                    status.code(),
-                    all_stderr,
-                    all_stdout
-                ),
-            }
-            .into());
-        }
+            (all_stdout, all_stderr)
+        };
 
         info!(
             app_id = %app_id,
@@ -266,27 +297,7 @@ impl DockerComposeManager {
 
         let app_dir = Self::get_app_dir(app_id);
 
-        // Execute: docker compose images --format json
-        let output = Command::new("docker")
-            .current_dir(&app_dir)
-            .args(["compose", "images", "--format", "json"])
-            .output()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_compose_images".to_string(),
-                reason: format!("Failed to execute docker compose images: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(DockerError::ContainerOperationFailed {
-                operation: "docker_compose_images".to_string(),
-                reason: format!("Command failed: {}", stderr),
-            }
-            .into());
-        }
-
-        #[derive(Deserialize)]
+        #[derive(serde::Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct ImageInfo {
             #[serde(rename = "ID")]
@@ -294,7 +305,43 @@ impl DockerComposeManager {
             container_name: String,
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        #[cfg(feature = "nitro")]
+        let stdout = {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_images(app_id, &working_dir).await?;
+            if !resp.success {
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_images".to_string(),
+                    reason: format!("Command failed: {}", resp.stderr),
+                }
+                .into());
+            }
+            resp.stdout
+        };
+
+        #[cfg(not(feature = "nitro"))]
+        let stdout = {
+            let output = Command::new("docker")
+                .current_dir(&app_dir)
+                .args(["compose", "images", "--format", "json"])
+                .output()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_images".to_string(),
+                    reason: format!("Failed to execute docker compose images: {}", e),
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_images".to_string(),
+                    reason: format!("Command failed: {}", stderr),
+                }
+                .into());
+            }
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
+
         let images: Vec<ImageInfo> =
             serde_json::from_str(&stdout).map_err(|e| DockerError::ContainerOperationFailed {
                 operation: "parse_images_json".to_string(),
@@ -346,26 +393,43 @@ impl DockerComposeManager {
     }
 
     async fn get_image_digest(image_id: &str) -> TappResult<String> {
-        let output = Command::new("docker")
-            .args(["inspect", "--format={{index .RepoDigests 0}}", image_id])
-            .output()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_inspect".to_string(),
-                reason: format!("Failed to inspect image: {}", e),
-            })?;
+        #[cfg(feature = "nitro")]
+        let digest_str = {
+            let resp = crate::docker_proxy::docker_inspect_digest(image_id).await?;
+            if !resp.success {
+                warn!(
+                    image_id = %image_id,
+                    stderr = %resp.stderr,
+                    "Failed to get digest from docker inspect (via proxy)"
+                );
+                return Ok(String::new());
+            }
+            resp.stdout.trim().to_string()
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(
-                image_id = %image_id,
-                stderr = %stderr,
-                "Failed to get digest from docker inspect"
-            );
-            return Ok(String::new());
-        }
+        #[cfg(not(feature = "nitro"))]
+        let digest_str = {
+            let output = Command::new("docker")
+                .args(["inspect", "--format={{index .RepoDigests 0}}", image_id])
+                .output()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_inspect".to_string(),
+                    reason: format!("Failed to inspect image: {}", e),
+                })?;
 
-        let digest_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    image_id = %image_id,
+                    stderr = %stderr,
+                    "Failed to get digest from docker inspect"
+                );
+                return Ok(String::new());
+            }
+
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
 
         // 如果没有 RepoDigests（可能是本地构建的镜像）
         if digest_str.is_empty() || digest_str == "<no value>" {
@@ -391,38 +455,62 @@ impl DockerComposeManager {
 
         info!(app_id = %app_id, "🛑 Stopping Docker Compose application");
 
-        // Execute docker compose down in app directory
-        let output = tokio::process::Command::new("docker")
-            .args(&["compose", "down"])
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
+        #[cfg(feature = "nitro")]
+        {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_down(app_id, &working_dir).await?;
+            if !resp.success {
+                error!(
+                    app_id = %app_id,
+                    stderr = %resp.stderr,
+                    "❌ Docker compose down failed (via proxy)"
+                );
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
                     operation: "stop".to_string(),
-                    reason: format!("Failed to execute docker compose down: {}", e),
-                })
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(
+                    reason: format!("docker compose down failed: {}", resp.stderr),
+                }));
+            }
+            info!(
                 app_id = %app_id,
-                stderr = %stderr,
-                "❌ Docker compose down failed"
+                output = %resp.stdout,
+                "✅ Docker compose down completed successfully"
             );
-            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
-                operation: "stop".to_string(),
-                reason: format!("docker compose down failed: {}", stderr),
-            }));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        info!(
-            app_id = %app_id,
-            output = %stdout,
-            "✅ Docker compose down completed successfully"
-        );
+        #[cfg(not(feature = "nitro"))]
+        {
+            let output = tokio::process::Command::new("docker")
+                .args(&["compose", "down"])
+                .current_dir(&app_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    TappError::Docker(DockerError::ContainerOperationFailed {
+                        operation: "stop".to_string(),
+                        reason: format!("Failed to execute docker compose down: {}", e),
+                    })
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(
+                    app_id = %app_id,
+                    stderr = %stderr,
+                    "❌ Docker compose down failed"
+                );
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "stop".to_string(),
+                    reason: format!("docker compose down failed: {}", stderr),
+                }));
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            info!(
+                app_id = %app_id,
+                output = %stdout,
+                "✅ Docker compose down completed successfully"
+            );
+        }
 
         Ok(())
     }
@@ -450,81 +538,122 @@ impl DockerComposeManager {
             });
         }
 
-        // Build docker compose logs command
-        // If lines <= 0, get all logs (no --tail parameter)
-        let mut args: Vec<String> = vec!["compose".to_string(), "logs".to_string()];
-        if lines > 0 {
-            args.push("--tail".to_string());
-            args.push(lines.to_string());
-        }
-
-        // Add service name if specified
-        if let Some(svc) = service_name {
-            if !svc.is_empty() {
-                args.push(svc.to_string());
-            }
-        }
-
-        // Execute command in app directory
-        let output = tokio::process::Command::new("docker")
-            .args(args.iter().map(|s| s.as_str()))
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
+        #[cfg(feature = "nitro")]
+        {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_logs(app_id, &working_dir, service_name, lines).await?;
+            if !resp.success {
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
                     operation: "get logs".to_string(),
-                    reason: format!("Failed to execute docker compose logs: {}", e),
-                })
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
-                operation: "get logs".to_string(),
-                reason: format!("docker compose logs failed: {}", stderr),
-            }));
+                    reason: format!("docker compose logs failed: {}", resp.stderr),
+                }));
+            }
+            return Ok(resp.stdout);
         }
 
-        let logs = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(logs)
+        #[cfg(not(feature = "nitro"))]
+        {
+            // Build docker compose logs command
+            // If lines <= 0, get all logs (no --tail parameter)
+            let mut args: Vec<String> = vec!["compose".to_string(), "logs".to_string()];
+            if lines > 0 {
+                args.push("--tail".to_string());
+                args.push(lines.to_string());
+            }
+
+            // Add service name if specified
+            if let Some(svc) = service_name {
+                if !svc.is_empty() {
+                    args.push(svc.to_string());
+                }
+            }
+
+            // Execute command in app directory
+            let output = tokio::process::Command::new("docker")
+                .args(args.iter().map(|s| s.as_str()))
+                .current_dir(&app_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    TappError::Docker(DockerError::ContainerOperationFailed {
+                        operation: "get logs".to_string(),
+                        reason: format!("Failed to execute docker compose logs: {}", e),
+                    })
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "get logs".to_string(),
+                    reason: format!("docker compose logs failed: {}", stderr),
+                }));
+            }
+
+            let logs = String::from_utf8_lossy(&output.stdout).to_string();
+            Ok(logs)
+        }
     }
 
     /// Stop a specific service within an app
     pub async fn stop_service(app_id: &str, service_name: &str) -> TappResult<()> {
         let app_dir = Self::get_app_dir(app_id);
 
-        let output = tokio::process::Command::new("docker")
-            .args(&["compose", "stop", service_name])
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
-                    operation: "stop_service".to_string(),
-                    reason: format!("Failed to execute docker compose stop: {}", e),
-                })
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(
+        #[cfg(feature = "nitro")]
+        {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_stop_service(app_id, &working_dir, service_name).await?;
+            if !resp.success {
+                error!(
+                    app_id = %app_id,
+                    stderr = %resp.stderr,
+                    "❌ Docker stop service failed (via proxy)"
+                );
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "stop".to_string(),
+                    reason: format!("docker stop service failed: {}", resp.stderr),
+                }));
+            }
+            info!(
                 app_id = %app_id,
-                stderr = %stderr,
-                "❌ Docker stop service failed"
+                output = %resp.stdout,
+                "✅ Docker stop service completed successfully"
             );
-            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
-                operation: "stop".to_string(),
-                reason: format!("docker stop service failed: {}", stderr),
-            }));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        info!(
-            app_id = %app_id,
-            output = %stdout,
-            "✅ Docker stop service completed successfully"
-        );
+        #[cfg(not(feature = "nitro"))]
+        {
+            let output = tokio::process::Command::new("docker")
+                .args(&["compose", "stop", service_name])
+                .current_dir(&app_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    TappError::Docker(DockerError::ContainerOperationFailed {
+                        operation: "stop_service".to_string(),
+                        reason: format!("Failed to execute docker compose stop: {}", e),
+                    })
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(
+                    app_id = %app_id,
+                    stderr = %stderr,
+                    "❌ Docker stop service failed"
+                );
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "stop".to_string(),
+                    reason: format!("docker stop service failed: {}", stderr),
+                }));
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            info!(
+                app_id = %app_id,
+                output = %stdout,
+                "✅ Docker stop service completed successfully"
+            );
+        }
 
         Ok(())
     }
@@ -537,35 +666,48 @@ impl DockerComposeManager {
             return Ok(false);
         }
 
-        // Execute: docker compose ps --services --filter "status=running" --format json
-        let output = tokio::process::Command::new("docker")
-            .args(&[
-                "compose",
-                "ps",
-                "--services",
-                "--filter",
-                "status=running",
-                "--format",
-                "json",
-            ])
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
-                    operation: "check_service_status".to_string(),
-                    reason: format!("Failed to execute docker compose ps: {}", e),
-                })
-            })?;
-
-        if !output.status.success() {
-            // If command fails, assume service is not running
-            return Ok(false);
+        #[cfg(feature = "nitro")]
+        {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_is_service_running(app_id, &working_dir, service_name).await?;
+            if !resp.success {
+                return Ok(false);
+            }
+            return Ok(resp.stdout.contains(service_name));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Check if service_name appears in the output
-        Ok(stdout.contains(service_name))
+        #[cfg(not(feature = "nitro"))]
+        {
+            // Execute: docker compose ps --services --filter "status=running" --format json
+            let output = tokio::process::Command::new("docker")
+                .args(&[
+                    "compose",
+                    "ps",
+                    "--services",
+                    "--filter",
+                    "status=running",
+                    "--format",
+                    "json",
+                ])
+                .current_dir(&app_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    TappError::Docker(DockerError::ContainerOperationFailed {
+                        operation: "check_service_status".to_string(),
+                        reason: format!("Failed to execute docker compose ps: {}", e),
+                    })
+                })?;
+
+            if !output.status.success() {
+                // If command fails, assume service is not running
+                return Ok(false);
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Check if service_name appears in the output
+            Ok(stdout.contains(service_name))
+        }
     }
 
     /// Get image hash for a specific service
@@ -585,31 +727,43 @@ impl DockerComposeManager {
             return Ok(Vec::new());
         }
 
-        // Execute: docker compose ps --format json
-        let output = Command::new("docker")
-            .current_dir(&app_dir)
-            .args(["compose", "ps", "--format", "json"])
-            .output()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "get_failed_services".to_string(),
-                reason: format!("Failed to execute docker compose ps: {}", e),
-            })?;
-
-        if !output.status.success() {
-            return Ok(Vec::new());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut failed_services = Vec::new();
-
-        #[derive(Deserialize)]
+        #[derive(serde::Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct ContainerInfo {
             name: String,
             state: String,
             service: Option<String>,
         }
+
+        #[cfg(feature = "nitro")]
+        let stdout = {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_ps(app_id, &working_dir).await?;
+            if !resp.success {
+                return Ok(Vec::new());
+            }
+            resp.stdout
+        };
+
+        #[cfg(not(feature = "nitro"))]
+        let stdout = {
+            let output = Command::new("docker")
+                .current_dir(&app_dir)
+                .args(["compose", "ps", "--format", "json"])
+                .output()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "get_failed_services".to_string(),
+                    reason: format!("Failed to execute docker compose ps: {}", e),
+                })?;
+
+            if !output.status.success() {
+                return Ok(Vec::new());
+            }
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
+
+        let mut failed_services = Vec::new();
 
         // Parse each line as JSON (docker compose ps outputs one JSON object per line)
         for line in stdout.lines() {
@@ -663,22 +817,33 @@ impl DockerComposeManager {
         }
 
         // Execute: docker compose ps --format json
-        let output = Command::new("docker")
-            .current_dir(&app_dir)
-            .args(["compose", "ps", "--format", "json"])
-            .output()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_compose_ps".to_string(),
-                reason: format!("Failed to execute docker compose ps: {}", e),
-            })?;
+        #[cfg(feature = "nitro")]
+        let (ps_success, stdout) = {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_ps(app_id, &working_dir).await?;
+            (resp.success, resp.stdout)
+        };
+
+        #[cfg(not(feature = "nitro"))]
+        let (ps_success, stdout) = {
+            let output = Command::new("docker")
+                .current_dir(&app_dir)
+                .args(["compose", "ps", "--format", "json"])
+                .output()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_compose_ps".to_string(),
+                    reason: format!("Failed to execute docker compose ps: {}", e),
+                })?;
+            (output.status.success(), String::from_utf8_lossy(&output.stdout).to_string())
+        };
 
         let mut containers = Vec::new();
         let mut running = false;
         let mut started_at: Option<i64> = None;
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        if ps_success {
+            let stdout = &stdout;
 
             #[derive(Deserialize)]
             #[serde(rename_all = "PascalCase")]
@@ -834,25 +999,42 @@ impl DockerComposeManager {
 
     /// Get container start time
     async fn get_container_start_time(container_name: &str) -> TappResult<i64> {
-        let output = Command::new("docker")
-            .args(["inspect", "--format={{.State.StartedAt}}", container_name])
-            .output()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_inspect_started_at".to_string(),
-                reason: format!("Failed to inspect container: {}", e),
-            })?;
-
-        if !output.status.success() {
-            return Err(DockerError::ContainerOperationFailed {
-                operation: "docker_inspect_started_at".to_string(),
-                reason: "Failed to get container start time".to_string(),
+        #[cfg(feature = "nitro")]
+        let time_str_owned = {
+            let resp = crate::docker_proxy::docker_inspect_started_at(container_name).await?;
+            if !resp.success {
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_inspect_started_at".to_string(),
+                    reason: "Failed to get container start time".to_string(),
+                }
+                .into());
             }
-            .into());
-        }
+            resp.stdout.trim().to_string()
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let time_str = stdout.trim();
+        #[cfg(not(feature = "nitro"))]
+        let time_str_owned = {
+            let output = Command::new("docker")
+                .args(["inspect", "--format={{.State.StartedAt}}", container_name])
+                .output()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_inspect_started_at".to_string(),
+                    reason: format!("Failed to inspect container: {}", e),
+                })?;
+
+            if !output.status.success() {
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_inspect_started_at".to_string(),
+                    reason: "Failed to get container start time".to_string(),
+                }
+                .into());
+            }
+
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        let time_str = time_str_owned.as_str();
 
         // Parse RFC3339 timestamp (e.g., "2024-01-01T12:00:00.123456789Z")
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(time_str) {
@@ -905,47 +1087,74 @@ impl DockerComposeManager {
             "🚀 Starting service"
         );
 
-        // Build docker compose up command
-        let mut args = vec!["compose", "up", "-d"];
-        if pull_image {
-            args.extend_from_slice(&["--pull", "always"]);
-        }
-        args.push(service_name);
-
-        // Execute docker compose up -d [--pull always] <service_name> in app directory
-        let output = tokio::process::Command::new("docker")
-            .args(&args)
-            .current_dir(&app_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                TappError::Docker(DockerError::ContainerOperationFailed {
+        #[cfg(feature = "nitro")]
+        {
+            let working_dir = app_dir.to_string_lossy().to_string();
+            let resp = crate::docker_proxy::compose_start_service(app_id, &working_dir, service_name, pull_image).await?;
+            if !resp.success {
+                error!(
+                    app_id = %app_id,
+                    service_name = %service_name,
+                    stderr = %resp.stderr,
+                    "❌ Docker compose up service failed (via proxy)"
+                );
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
                     operation: "start_service".to_string(),
-                    reason: format!("Failed to execute docker compose up: {}", e),
-                })
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(
+                    reason: format!("docker compose up {} failed: {}", service_name, resp.stderr),
+                }));
+            }
+            info!(
                 app_id = %app_id,
                 service_name = %service_name,
-                stderr = %stderr,
-                "❌ Docker compose up service failed"
+                output = %resp.stdout,
+                "✅ Service started successfully"
             );
-            return Err(TappError::Docker(DockerError::ContainerOperationFailed {
-                operation: "start_service".to_string(),
-                reason: format!("docker compose up {} failed: {}", service_name, stderr),
-            }));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        info!(
-            app_id = %app_id,
-            service_name = %service_name,
-            output = %stdout,
-            "✅ Service started successfully"
-        );
+        #[cfg(not(feature = "nitro"))]
+        {
+            // Build docker compose up command
+            let mut args = vec!["compose", "up", "-d"];
+            if pull_image {
+                args.extend_from_slice(&["--pull", "always"]);
+            }
+            args.push(service_name);
+
+            // Execute docker compose up -d [--pull always] <service_name> in app directory
+            let output = tokio::process::Command::new("docker")
+                .args(&args)
+                .current_dir(&app_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    TappError::Docker(DockerError::ContainerOperationFailed {
+                        operation: "start_service".to_string(),
+                        reason: format!("Failed to execute docker compose up: {}", e),
+                    })
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(
+                    app_id = %app_id,
+                    service_name = %service_name,
+                    stderr = %stderr,
+                    "❌ Docker compose up service failed"
+                );
+                return Err(TappError::Docker(DockerError::ContainerOperationFailed {
+                    operation: "start_service".to_string(),
+                    reason: format!("docker compose up {} failed: {}", service_name, stderr),
+                }));
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            info!(
+                app_id = %app_id,
+                service_name = %service_name,
+                output = %stdout,
+                "✅ Service started successfully"
+            );
+        }
 
         Ok(())
     }
@@ -954,39 +1163,58 @@ impl DockerComposeManager {
     pub async fn prune_images(all: bool) -> TappResult<PruneImagesResult> {
         info!(all = all, "🧹 Pruning Docker images");
 
-        // Build docker image prune command
-        let mut args = vec!["system", "prune", "-f"];
-
-        if all {
-            args.push("--all");
-        }
-
-        // Note: docker image prune doesn't have --dry-run flag
-        // We'll execute the command and parse the output
-        info!(args = ?args, "Executing docker image prune");
-        let output = Command::new("docker")
-            .args(&args)
-            .output()
-            .await
-            .map_err(|e| DockerError::ContainerOperationFailed {
-                operation: "docker_image_prune".to_string(),
-                reason: format!("Failed to execute docker image prune: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(
-                stderr = %stderr,
-                "❌ Docker image prune failed"
-            );
-            return Err(DockerError::ContainerOperationFailed {
-                operation: "docker_image_prune".to_string(),
-                reason: format!("docker image prune failed: {}", stderr),
+        #[cfg(feature = "nitro")]
+        let stdout = {
+            let resp = crate::docker_proxy::docker_prune(all).await?;
+            if !resp.success {
+                error!(
+                    stderr = %resp.stderr,
+                    "❌ Docker image prune failed (via proxy)"
+                );
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_image_prune".to_string(),
+                    reason: format!("docker image prune failed: {}", resp.stderr),
+                }
+                .into());
             }
-            .into());
-        }
+            resp.stdout
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        #[cfg(not(feature = "nitro"))]
+        let stdout = {
+            // Build docker image prune command
+            let mut args = vec!["system", "prune", "-f"];
+
+            if all {
+                args.push("--all");
+            }
+
+            // Note: docker image prune doesn't have --dry-run flag
+            // We'll execute the command and parse the output
+            info!(args = ?args, "Executing docker image prune");
+            let output = Command::new("docker")
+                .args(&args)
+                .output()
+                .await
+                .map_err(|e| DockerError::ContainerOperationFailed {
+                    operation: "docker_image_prune".to_string(),
+                    reason: format!("Failed to execute docker image prune: {}", e),
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(
+                    stderr = %stderr,
+                    "❌ Docker image prune failed"
+                );
+                return Err(DockerError::ContainerOperationFailed {
+                    operation: "docker_image_prune".to_string(),
+                    reason: format!("docker image prune failed: {}", stderr),
+                }
+                .into());
+            }
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
 
         // Parse output to extract information
         // Docker output format: "Deleted Images:\ndeleted: <id>\n...\nTotal reclaimed space: <size>"
