@@ -1,3 +1,4 @@
+pub mod compose_validator;
 pub mod manager;
 pub mod measurement;
 

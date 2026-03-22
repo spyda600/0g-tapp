@@ -143,6 +143,12 @@ impl DockerComposeManager {
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::sync::Mutex;
 
+        // 0. Validate and sanitize compose content before writing to disk
+        let limits = super::compose_validator::ResourceLimits::default();
+        let sanitized_content =
+            super::compose_validator::validate_and_sanitize(compose_content, &limits)?;
+        info!(app_id = %app_id, "Compose content validated and sanitized");
+
         // 1. store compose file
         let base_path = Self::get_app_dir(app_id);
         if !base_path.exists() {
@@ -153,7 +159,7 @@ impl DockerComposeManager {
             })?;
         }
         let compose_path = base_path.join("docker-compose.yml");
-        fs::write(&compose_path, compose_content).await?;
+        fs::write(&compose_path, &sanitized_content).await?;
 
         // 2. store mount files to corresponding location
         Self::store_mount_files(&base_path, mount_files).await?;
