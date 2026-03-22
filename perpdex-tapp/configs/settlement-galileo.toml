@@ -1,0 +1,70 @@
+[server]
+host = "0.0.0.0"
+port = 3002
+workers = 2
+request_timeout = 30
+max_request_size = 1048576
+
+[database]
+url = "postgresql://postgres:postgres@postgres:5432/jane_perps"
+max_connections = 5
+min_connections = 1
+connection_timeout = 30
+
+[redis]
+url = "redis://redis:6379"
+pool_size = 10
+connection_timeout = 5000
+command_timeout = 3000
+
+[kafka]
+brokers = ["kafka:29092"]
+group_id = "jane-perps-settlement"
+
+[kafka.topics]
+orderbook_snapshots = "orderbook-snapshots"
+trade_events = "trade-events"
+position_updates = "position-updates"
+liquidation_events = "liquidation-events"
+price_updates = "price-updates"
+deposit_request_event = "deposit-request-event"
+deposit_response_event = "deposit-response-event"
+match_order_event = "match-order-event"
+withdraw_collateral_event = "withdraw-collateral-event"
+db_event = "db-event"
+account_nonce_event = "account-nonce-event"
+price_update_response_event = "price-update-response-event"
+
+[metrics]
+enabled = true
+port = 9093
+path = "/metrics"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[trading]
+max_position_size = 1000000.0
+max_leverage = 100.0
+liquidation_threshold = 0.05
+trading_fee = 0.001
+maker_fee = 0.0005
+taker_fee = 0.001
+supported_pairs = ["BTC/USD", "ETH/USD", "SOL/USD", "0G/USD"]
+
+[oracle]
+update_price_secs = 0
+public_price_secs = 0
+chainlink = []
+coingecko = []
+
+[chain_config]
+# Private key injected via env var: JANE_PERPS__CHAIN_CONFIG__PRIVATE_KEY
+rpc_url = "https://palpable-hidden-river.0g-galileo.quiknode.pro/f1df991b69a02d77caedca97c5240e702fa6121c/"
+private_key = ""
+endpoint_contract = "0x96611D468f9F755bF6Cb0C21E277065Ac576C225"
+tx_size = 2
+first_deposit_block = 21953700
+test_user_addr = "0x901b99b4285639bc4045714047c0e4e40354a3e2"
+test_user_name = "default"

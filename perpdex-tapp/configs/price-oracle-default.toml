@@ -1,0 +1,70 @@
+[server]
+host = "0.0.0.0"
+port = 3003
+workers = 2
+request_timeout = 30
+max_request_size = 1048576
+
+[oracle]
+update_price_secs = 60
+public_price_secs = 10
+
+[[oracle.chainlink]]
+name = "chainlink"
+weight = 0.7
+url = "https://eth.llamarpc.com"
+feeds = [
+    { pair = "BTC/USD", address = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c", decimals = 8, description = "BTC / USD" },
+    { pair = "ETH/USD", address = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419", decimals = 8, description = "ETH / USD" },
+]
+
+[[oracle.coingecko]]
+name = "coingecko"
+weight = 0.3
+url = "https://api.coingecko.com/api/v3"
+coins = [
+    { pair = "BTC/USD", id = "bitcoin" },
+    { pair = "ETH/USD", id = "ethereum" },
+]
+
+[redis]
+url = "redis://redis:6379"
+pool_size = 10
+connection_timeout = 5000
+command_timeout = 3000
+
+[kafka]
+brokers = ["kafka:29092"]
+group_id = "jane-perps-price-oracle"
+
+[kafka.topics]
+orderbook_snapshots = "orderbook-snapshots"
+trade_events = "trade-events"
+position_updates = "position-updates"
+liquidation_events = "liquidation-events"
+price_updates = "price-updates"
+deposit_request_event = "deposit-request-event"
+deposit_response_event = "deposit-response-event"
+match_order_event = "match-order-event"
+withdraw_collateral_event = "withdraw-collateral-event"
+db_event = "db-event"
+account_nonce_event = "account-nonce-event"
+price_update_response_event = "price-update-response-event"
+
+[metrics]
+enabled = true
+port = 9092
+path = "/metrics"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[trading]
+max_position_size = 1000000.0
+max_leverage = 100.0
+liquidation_threshold = 0.05
+trading_fee = 0.001
+maker_fee = 0.0005
+taker_fee = 0.001
+supported_pairs = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD"]

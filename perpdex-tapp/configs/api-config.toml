@@ -1,0 +1,72 @@
+port = 3000
+serve_timeout_secs = 60
+
+api_key_expiry_days = 30
+wal_path = "/app/runtime/wal.log"
+
+[logging]
+level = "info"
+include_headers = false
+directory = "/tmp/perpdex-api-logs"
+stdout_writer = true
+
+[database]
+host = "postgres"
+port = 5432
+db = "jane_perps"
+user = "postgres"
+password = "postgres"
+db_wal_path = "/app/runtime/db_wal.log"
+
+[governor]
+replenish_in_millisecs = 1
+burst_size = 100000
+
+[engine]
+worker_channel_size = 10000
+
+[[engine.spot_products]]
+id = 1
+tick_size = 1000000000
+max_price = 1000000000000000
+initial_price = 0
+
+[[engine.spot_products]]
+id = 3
+tick_size = 1000000000
+max_price = 1000000000000000
+initial_price = 0
+
+[[engine.perp_products]]
+id = 2
+tick_size = 1_000_000_000
+max_price = 1_000_000_000_000_000
+initial_price = 1_00_000_000_000_000
+long_weight_initial = 1_000_000_000
+short_weight_initial = 1_000_000_000
+long_weight_maintenance = 1_000_000_000
+short_weight_maintenance = 1_000_000_000
+
+[kafka]
+brokers = ["kafka:29092"]
+group_id = "api-service"
+
+[kafka.topics]
+orderbook_snapshots = "orderbook-snapshots"
+trade_events = "trade-events"
+position_updates = "position-updates"
+liquidation_events = "liquidation-events"
+price_updates = "price-updates"
+deposit_request_event = "deposit-request-event"
+deposit_response_event = "deposit-response-event"
+match_order_event = "match-order-event"
+withdraw_collateral_event = "withdraw-collateral-event"
+db_event = "db-event"
+account_nonce_event = "account-nonce-event"
+price_update_response_event = "price-update-response-event"
+
+[test]
+test_mode = false
+
+[cors]
+allowed_origins = ["*"]

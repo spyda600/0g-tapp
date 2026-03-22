@@ -1,0 +1,163 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    restart: on-failure
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_HEAP_OPTS: "-Xmx128m -Xms64m"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - perpdex
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    restart: on-failure
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_CLEANUP_POLICY: compact
+      KAFKA_LOG_SEGMENT_MS: 60000
+      KAFKA_LOG_MIN_CLEANABLE_DIRTY_RATIO: "0.1"
+      KAFKA_LOG_DELETE_DELAY_MS: 1000
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - perpdex
+
+  redis:
+    image: redis:7-alpine
+    hostname: redis
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: on-failure
+    command: redis-server --appendonly yes --maxmemory 96mb --maxmemory-policy allkeys-lru --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - perpdex
+
+  postgres:
+    image: postgres:15
+    hostname: postgres
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    restart: on-failure
+    environment:
+      POSTGRES_DB: jane_perps
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jane_perps"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - perpdex
+
+  api-service:
+    image: ghcr.io/spyda600/perpdex-api-service:testnet
+    hostname: api-service
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    restart: on-failure
+    ports:
+      - "3000:3000"
+    environment:
+      RUN_MODE: production
+    volumes:
+      - ./api-config.toml:/app/config/local.toml:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - perpdex
+
+  settlement-service:
+    image: ghcr.io/spyda600/perpdex-settlement-service:testnet
+    hostname: settlement-service
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    restart: on-failure
+    environment:
+      RUN_MODE: production
+      JANE_PERPS__CHAIN_CONFIG__PRIVATE_KEY: "${JANE_PERPS__CHAIN_CONFIG__PRIVATE_KEY}"
+    volumes:
+      - ./settlement-galileo.toml:/app/config/galileo.toml:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - perpdex
+
+  price-oracle:
+    image: ghcr.io/spyda600/perpdex-price-oracle:testnet
+    hostname: price-oracle
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    restart: on-failure
+    environment:
+      RUN_MODE: production
+    volumes:
+      - ./price-oracle-default.toml:/app/config/default.toml:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - perpdex
+
+networks:
+  perpdex:
+    driver: bridge
