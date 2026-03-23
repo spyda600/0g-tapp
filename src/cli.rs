@@ -6,8 +6,9 @@ use tapp_service::proto::{
     DockerLogoutRequest, GetAppContainerStatusRequest, GetAppInfoRequest, GetAppKeyRequest,
     GetAppLogsRequest, GetAppSecretKeyRequest, GetEvidenceRequest, GetServiceLogsRequest,
     GetServiceStatusRequest, GetTappInfoRequest, GetTaskStatusRequest, ListWhitelistRequest,
-    MountFile, PruneImagesRequest, RemoveFromWhitelistRequest, StartAppRequest,
-    StartServiceRequest, StopAppRequest, StopServiceRequest, WithdrawBalanceRequest,
+    MountFile, PruneImagesRequest, RemoveFromWhitelistRequest, SignTransactionRequest,
+    StartAppRequest, StartServiceRequest, StopAppRequest, StopServiceRequest,
+    WithdrawBalanceRequest,
 };
 use tonic::{metadata::MetadataValue, Request};
 
@@ -240,6 +241,41 @@ enum Commands {
         recipient: Option<String>,
     },
 
+    /// Sign a transaction inside the enclave (private key never leaves)
+    SignTransaction {
+        /// Application ID (determines which key signs)
+        #[arg(short, long)]
+        app_id: String,
+
+        /// Destination address (hex, e.g. "0xabcd...")
+        #[arg(short, long)]
+        to_address: String,
+
+        /// Value in wei (decimal string, default "0")
+        #[arg(short, long, default_value = "0")]
+        value: String,
+
+        /// Calldata hex (without 0x prefix, default empty)
+        #[arg(long, default_value = "")]
+        data: String,
+
+        /// EIP-155 chain ID
+        #[arg(short, long)]
+        chain_id: u64,
+
+        /// Gas limit
+        #[arg(short, long)]
+        gas_limit: u64,
+
+        /// Gas price in wei (optional, decimal string)
+        #[arg(long)]
+        gas_price: Option<String>,
+
+        /// Transaction nonce (optional)
+        #[arg(long)]
+        nonce: Option<u64>,
+    },
+
     /// Sign a message using a private key
     SignMessage {
         /// Private key (32 bytes hex)
@@ -401,6 +437,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rpc_url,
                 chain_id,
                 recipient,
+                private_key,
+            )
+            .await?;
+        }
+        Commands::SignTransaction {
+            app_id,
+            to_address,
+            value,
+            data,
+            chain_id,
+            gas_limit,
+            gas_price,
+            nonce,
+        } => {
+            let private_key = require_private_key(&cli.private_key)?;
+            sign_transaction(
+                &cli.server,
+                app_id,
+                to_address,
+                value,
+                data,
+                chain_id,
+                gas_limit,
+                gas_price,
+                nonce,
                 private_key,
             )
             .await?;
@@ -1259,6 +1320,67 @@ async fn withdraw_balance(
         println!("  Gas Used: {}", result.gas_used);
     } else {
         eprintln!("✗ {}", result.message);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn sign_transaction(
+    server: &str,
+    app_id: String,
+    to_address: String,
+    value: String,
+    data_hex: String,
+    chain_id: u64,
+    gas_limit: u64,
+    gas_price: Option<String>,
+    nonce: Option<u64>,
+    private_key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TappServiceClient::connect(server.to_string()).await?;
+
+    // Decode calldata from hex if provided
+    let data = if data_hex.is_empty() {
+        vec![]
+    } else {
+        let hex_str = data_hex
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        hex::decode(hex_str).map_err(|e| format!("Invalid calldata hex: {}", e))?
+    };
+
+    let mut request = Request::new(SignTransactionRequest {
+        app_id: app_id.clone(),
+        to_address: to_address.clone(),
+        value: value.clone(),
+        data,
+        chain_id,
+        gas_limit,
+        gas_price: gas_price.unwrap_or_default(),
+        nonce: nonce.unwrap_or(0),
+    });
+
+    add_signature_metadata(&mut request, &private_key, "SignTransaction")?;
+
+    let response = client.sign_transaction(request).await?;
+    let result = response.into_inner();
+
+    if result.success {
+        println!("Transaction signed successfully (key never left the enclave)");
+        println!("  App ID: {}", app_id);
+        println!("  From: {}", result.from_address);
+        println!("  To: {}", to_address);
+        println!("  Value: {} wei", value);
+        println!("  Chain ID: {}", chain_id);
+        println!("  Gas Limit: {}", gas_limit);
+        println!("  Tx Hash: {}", result.tx_hash);
+        println!(
+            "  Signed Tx (hex): 0x{}",
+            hex::encode(&result.signed_tx)
+        );
+    } else {
+        eprintln!("Failed: {}", result.message);
         std::process::exit(1);
     }
 

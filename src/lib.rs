@@ -7,6 +7,7 @@ pub mod config;
 pub mod docker_proxy;
 pub mod error;
 pub mod tee;
+pub mod tx_validator;
 pub mod update_safety;
 pub mod measurement_service;
 pub mod nonce_manager;
@@ -1111,6 +1112,118 @@ impl TappService for TappServiceImpl {
             amount: result.amount,
             gas_used: result.gas_used,
             gas_price: result.gas_price.parse().unwrap_or(0),
+            timestamp: chrono::Utc::now().timestamp(),
+        }))
+    }
+
+    async fn sign_transaction(
+        &self,
+        request: Request<SignTransactionRequest>,
+    ) -> Result<Response<SignTransactionResponse>, Status> {
+        info!("Calling SignTransaction");
+        debug!("Request: {:?}", request);
+        let signer = auth_layer::get_signer_address(&request);
+
+        let req = request.into_inner();
+        let app_id = &req.app_id;
+
+        // Validate transaction parameters
+        let params = tx_validator::validate_transaction_request(
+            &req.to_address,
+            &req.value,
+            req.chain_id,
+            req.gas_limit,
+            &req.gas_price,
+            req.nonce,
+            &req.data,
+        )
+        .map_err(|e| Status::invalid_argument(format!("{}", e)))?;
+
+        // Get app private key — stays in enclave memory, never sent over the wire
+        let private_key = self
+            .app_key_service
+            .get_private_key(app_id)
+            .await
+            .map_err(|e| Status::not_found(format!("App key not found: {}", e)))?;
+
+        // Build wallet from private key bytes
+        use ethers::prelude::*;
+        use ethers::types::transaction::eip2718::TypedTransaction;
+
+        let wallet = LocalWallet::from_bytes(&private_key)
+            .map_err(|e| Status::internal(format!("Invalid private key: {}", e)))?
+            .with_chain_id(params.chain_id);
+
+        let from_address = wallet.address();
+
+        // Build a legacy (EIP-155) transaction
+        let mut tx_request = ethers::types::TransactionRequest::new()
+            .from(from_address)
+            .to(params.to_address)
+            .value(params.value)
+            .gas(params.gas_limit)
+            .chain_id(params.chain_id)
+            .data(ethers::types::Bytes::from(params.data));
+
+        if let Some(gp) = params.gas_price {
+            tx_request = tx_request.gas_price(gp);
+        }
+
+        if let Some(n) = params.nonce {
+            tx_request = tx_request.nonce(n);
+        }
+
+        let typed_tx: TypedTransaction = tx_request.into();
+
+        // Sign the transaction (synchronous — no network call)
+        let signature = wallet
+            .sign_transaction_sync(&typed_tx)
+            .map_err(|e| Status::internal(format!("Failed to sign transaction: {}", e)))?;
+
+        // RLP-encode the signed transaction
+        let signed_tx_bytes = typed_tx.rlp_signed(&signature);
+        let tx_hash = typed_tx.hash(&signature);
+
+        // Record measurement
+        let measurement = serde_json::json!({
+            "operation": measurement_service::OPERATION_NAME_SIGN_TRANSACTION,
+            "app_id": app_id,
+            "from_address": format!("{:?}", from_address),
+            "to_address": format!("{:?}", params.to_address),
+            "value": req.value,
+            "chain_id": params.chain_id,
+            "gas_limit": params.gas_limit,
+            "tx_hash": format!("{:?}", tx_hash),
+            "signer": signer,
+            "timestamp": chrono::Utc::now().timestamp(),
+        });
+
+        if let Err(e) = self
+            .measurement_service
+            .extend_measurement(
+                measurement_service::OPERATION_NAME_SIGN_TRANSACTION,
+                &measurement.to_string(),
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, "Failed to record sign_transaction measurement");
+        }
+
+        tracing::info!(
+            app_id = %app_id,
+            tx_hash = ?tx_hash,
+            to = %req.to_address,
+            value = %req.value,
+            event = "SIGN_TRANSACTION_SUCCESS",
+            "Transaction signed successfully inside enclave"
+        );
+
+        Ok(Response::new(SignTransactionResponse {
+            success: true,
+            message: "Transaction signed".to_string(),
+            signed_tx: signed_tx_bytes.to_vec(),
+            tx_hash: format!("{:?}", tx_hash),
+            from_address: format!("{:?}", from_address),
             timestamp: chrono::Utc::now().timestamp(),
         }))
     }

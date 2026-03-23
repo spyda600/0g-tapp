@@ -263,6 +263,9 @@ fn get_method_permission(method_name: &str) -> MethodPermission {
         // Secret key access is owner-only — this returns private key material
         "GetAppSecretKey" => MethodPermission::OwnerOnly,
 
+        // Transaction signing is owner-only — controls spending from the app wallet
+        "SignTransaction" => MethodPermission::OwnerOnly,
+
         // Owner-only methods
         "StartApp"
         | "StopApp"

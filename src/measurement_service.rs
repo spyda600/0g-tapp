@@ -16,6 +16,7 @@ pub const OPERATION_NAME_DOCKER_LOGIN: &str = "docker_login";
 pub const OPERATION_NAME_DOCKER_LOGOUT: &str = "docker_logout";
 pub const OPERATION_NAME_STOP_SERVICE: &str = "stop_service";
 pub const OPERATION_NAME_START_SERVICE: &str = "start_service";
+pub const OPERATION_NAME_SIGN_TRANSACTION: &str = "sign_transaction";
 
 pub struct MeasurementService {
     provider: Arc<dyn TeeProvider>,
@@ -30,7 +31,7 @@ impl MeasurementService {
     pub async fn extend_measurement(&self, operation_name: &str, data: &str) -> TappResult<()> {
         // Use register 2 for most operations, register 3 for key/balance operations
         let register = match operation_name {
-            "get_app_secret_key" | "withdraw_balance" => 3,
+            "get_app_secret_key" | "withdraw_balance" | "sign_transaction" => 3,
             _ => 2,
         };
 
