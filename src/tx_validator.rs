@@ -8,6 +8,14 @@ const MIN_GAS_LIMIT: u64 = 21_000;
 /// Maximum gas limit we allow (block gas limit ballpark).
 const MAX_GAS_LIMIT: u64 = 30_000_000;
 
+/// Maximum gas price: 10,000 gwei (10^13 wei).
+/// Prevents fund drain via exorbitant gas fees.
+/// At max gas_limit (30M) * max gas_price (10k gwei) = 0.3 ETH max gas cost.
+const MAX_GAS_PRICE_WEI: &str = "10000000000000"; // 10^13
+
+/// Maximum calldata size: 128 KB.
+const MAX_CALLDATA_SIZE: usize = 128 * 1024;
+
 /// Validated transaction parameters ready for signing.
 pub struct ValidatedTxParams {
     pub to_address: Address,
@@ -77,21 +85,43 @@ pub fn validate_transaction_request(
         });
     }
 
-    // --- gas_price (optional) ---
+    // --- gas_price (optional, capped to prevent fund drain via fees) ---
+    let max_gp = U256::from_dec_str(MAX_GAS_PRICE_WEI).unwrap();
     let gp = if gas_price.is_empty() {
         None
     } else {
-        Some(
-            U256::from_dec_str(gas_price).map_err(|_| TappError::InvalidParameter {
+        let parsed = U256::from_dec_str(gas_price).map_err(|_| TappError::InvalidParameter {
+            field: "gas_price".to_string(),
+            reason: format!("cannot parse as U256: {}", gas_price),
+        })?;
+        if parsed > max_gp {
+            return Err(TappError::InvalidParameter {
                 field: "gas_price".to_string(),
-                reason: format!("cannot parse as U256: {}", gas_price),
-            })?,
-        )
+                reason: format!(
+                    "exceeds maximum allowed gas price ({} wei / ~10000 gwei)",
+                    MAX_GAS_PRICE_WEI
+                ),
+            });
+        }
+        Some(parsed)
     };
 
+    // --- calldata size ---
+    if data.len() > MAX_CALLDATA_SIZE {
+        return Err(TappError::InvalidParameter {
+            field: "data".to_string(),
+            reason: format!(
+                "calldata too large: {} bytes (max {})",
+                data.len(),
+                MAX_CALLDATA_SIZE
+            ),
+        });
+    }
+
     // --- nonce (0 means "caller must provide", treated as optional) ---
-    // We pass through: 0 means the caller explicitly set nonce=0 OR left it unset.
-    // The handler decides how to interpret this.
+    // Protobuf uint64 defaults to 0. We treat 0 as "not set".
+    // For fresh wallets needing nonce=0, callers should use a bool flag or
+    // handle nonce externally. This is a known limitation documented in the proto.
     let nonce_opt = if nonce == 0 { None } else { Some(nonce) };
 
     Ok(ValidatedTxParams {

@@ -1121,11 +1121,20 @@ impl TappService for TappServiceImpl {
         request: Request<SignTransactionRequest>,
     ) -> Result<Response<SignTransactionResponse>, Status> {
         info!("Calling SignTransaction");
-        debug!("Request: {:?}", request);
+        // NOTE: Do NOT log the full request — it may contain sensitive calldata.
+        // Only log non-sensitive fields after extraction.
         let signer = auth_layer::get_signer_address(&request);
 
         let req = request.into_inner();
         let app_id = &req.app_id;
+
+        debug!(
+            app_id = %app_id,
+            to = %req.to_address,
+            chain_id = req.chain_id,
+            gas_limit = req.gas_limit,
+            "SignTransaction parameters (value and calldata omitted)"
+        );
 
         // Validate transaction parameters
         let params = tx_validator::validate_transaction_request(
